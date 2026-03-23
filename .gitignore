@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+*.o
+*.out
+*.a
+*.so
+
+# Profiling outputs
+results/*.nsys-rep
+results/*.sqlite
+results/*.qdrep
+
+# CUDA intermediate files
+*.cubin
+*.ptx
+*.fatbin
+
+# Editor / OS
+.vscode/
+*.swp
+*~
+.DS_Store
