@@ -14,7 +14,7 @@
 # ============================================================
 
 NVCC      := nvcc
-ARCH      := -arch=sm_90
+ARCH      := -arch=sm_90a
 INCDIR    := include
 BUILDDIR  := build
 

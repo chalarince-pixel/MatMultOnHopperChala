@@ -37,13 +37,13 @@ typedef struct {
 // ─────────────────────────────────────────────────────────────
 
 // Get a matrix element
-__device__ float GetElement(const Matrix A, int row, int col) {
-  return A.elements[row * A.stride + col];
+__device__ float GetElement(const Matrix M, int row, int col) {
+  return M.elements[row * M.stride + col];
 }
 
 // Set a matrix element
-__device__ void SetElement(Matrix A, int row, int col, float value) {
-  A.elements[row * A.stride + col] = value;
+__device__ void SetElement(Matrix M, int row, int col, float value) {
+  M.elements[row * M.stride + col] = value;
 }
 
 // Get the BLOCK_SIZE×BLOCK_SIZE sub-matrix Asub of A that is located
@@ -61,9 +61,6 @@ __device__ Matrix GetSubMatrix(Matrix A, int row, int col) {
 // ─────────────────────────────────────────────────────────────
 // Kernel
 // ─────────────────────────────────────────────────────────────
-
-// Forward declaration — qualifiers must match the definition below.
-__global__ void MatMulKernel(Matrix A, Matrix B, Matrix C);
 
 // Matrix multiplication kernel called by MatMul().
 // Each thread block computes one BLOCK_SIZE×BLOCK_SIZE tile of C.
