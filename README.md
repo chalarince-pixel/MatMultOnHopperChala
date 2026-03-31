@@ -10,11 +10,11 @@ The graphs below capture the substantial performance improvements gained by tran
 
 **Throughput (TFLOPS) vs. Matrix Dimension (Log-scale) — Higher is Better:**
 
-![Throughput Comparison](results/benchmark_tflops.png)
+<img src="./results/benchmark_tflops.png" alt="Throughput Comparison" width="800">
 
 **Execution Runtime (ms) vs. Matrix Dimension (Log-scale) — Lower is Better:**
 
-![Runtime Comparison](results/benchmark_all.png)
+<img src="./results/benchmark_all.png" alt="Runtime Comparison" width="800">
 
 ---
 
