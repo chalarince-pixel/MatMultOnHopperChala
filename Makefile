@@ -32,20 +32,21 @@ BINS := $(patsubst %.cu,%,$(notdir $(SRCS)))
 # ── Default: release build of every target ───────────────────
 all: $(BINS)
 
-# Pattern rule: build/XYZ  ←  any_folder/XYZ.cu
-# Secondary expansion lets us look up the source for each binary.
-.SECONDEXPANSION:
-$(BINS): %: $$(wildcard */$$.cu) | $(BUILDDIR)
-	$(NVCC) $(COMMON_FLAGS) $(RELEASE_FLAGS) $(LDFLAGS) -o $(BUILDDIR)/$@ $<
-	@echo "\n✅  Release build complete: $(BUILDDIR)/$@"
+# Generate explicit build rules for each target
+define MAKE_TARGET
+$(2): $(1) | $$(BUILDDIR)
+	$$(NVCC) $$(COMMON_FLAGS) $$(RELEASE_FLAGS) $$(LDFLAGS) -o $$(BUILDDIR)/$$@ $$<
+	@echo "\n✅  Release build complete: $$(BUILDDIR)/$$@"
 
-# ── Debug build ───────────────────────────────────────────────
+debug_$(2): $(1) | $$(BUILDDIR)
+	$$(NVCC) $$(COMMON_FLAGS) $$(DEBUG_FLAGS) -o $$(BUILDDIR)/$(2)_debug $$<
+	@echo "\n✅  Debug build complete: $$(BUILDDIR)/$(2)_debug"
+endef
+
+$(foreach src,$(SRCS),$(eval $(call MAKE_TARGET,$(src),$(patsubst %.cu,%,$(notdir $(src))))))
+
+# ── Debug build target  ──────────────────────────────────────
 debug: $(addprefix debug_,$(BINS))
-
-.SECONDEXPANSION:
-$(addprefix debug_,$(BINS)): debug_%: $$(wildcard */$$.cu) | $(BUILDDIR)
-	$(NVCC) $(COMMON_FLAGS) $(DEBUG_FLAGS) -o $(BUILDDIR)/$*_debug $<
-	@echo "\n✅  Debug build complete: $(BUILDDIR)/$*_debug"
 
 # ── Convenience run targets ───────────────────────────────────
 $(addprefix run_,$(BINS)): run_%: %
@@ -75,5 +76,6 @@ clean:
 	rm -rf $(BUILDDIR) results/*.nsys-rep results/*.sqlite
 
 .PHONY: all debug sanitize profile clean \
+        $(BINS) \
         $(addprefix run_,$(BINS)) \
         $(addprefix debug_,$(BINS))
