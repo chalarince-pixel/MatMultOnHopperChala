@@ -10,11 +10,11 @@ The graphs below capture the substantial performance improvements gained by tran
 
 **Throughput (TFLOPS) vs. Matrix Dimension (Log-scale) — Higher is Better:**
 
-<img src="./results/benchmark_tflops.png" alt="Throughput Comparison" width="800">
+![Throughput Comparison](./results/benchmark_tflops.png)
 
 **Execution Runtime (ms) vs. Matrix Dimension (Log-scale) — Lower is Better:**
 
-<img src="./results/benchmark_all.png" alt="Runtime Comparison" width="800">
+![Runtime Comparison](./results/benchmark_all.png)
 
 ---
 
@@ -55,9 +55,9 @@ cuda-assignment/
 ├── build/                         # Compiled binaries
 ├── include/
 │   └── utils.cuh                  # Shared macros (CUDA_CHECK) and utilities
-├── results/                       # Data are created in this output folder (Profiling/Benchmark outputs)
-├── plot_all.py                    # Script to plot benchmarking data across all kernels
-├── plot_results.py                # Script to plot performance charts
+├── results/                       # Benchmark outputs, CSVs, scripts, and plots
+│   ├── plot_all.py                # Script to plot benchmarking data across all kernels
+│   └── plot_results.py            # Script to plot performance charts
 └── Makefile                       # Automated build system
 ```
 
@@ -75,6 +75,7 @@ To visualize the performance (e.g., Matrix Dimensions vs. Runtime or Matrix Dime
 make run_all
 
 # Run the Python plotting scripts
+cd results
 python3 plot_all.py 
 python3 plot_results.py
 ```
