@@ -1,0 +1,17 @@
+=== GPU: NVIDIA H100 80GB HBM3 ===
+  Compute Capability : 9.0
+  Global Memory      : 85.0 GB
+  SMs                : 132
+  Max threads/block  : 1024
+  Warp size          : 32
+================================
+
+WGMMA BF16 Benchmark
+dtype,N,ms,tflops
+BF16+WGMMA,128,0.0038,1.11
+BF16+WGMMA,256,0.0050,6.74
+BF16+WGMMA,512,0.0077,34.82
+BF16+WGMMA,1024,0.0131,163.34
+BF16+WGMMA,2048,0.0404,425.70
+BF16+WGMMA,4096,0.2946,466.59
+BF16+WGMMA,8192,2.2923,479.65

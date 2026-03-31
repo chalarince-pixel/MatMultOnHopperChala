@@ -6,13 +6,16 @@
 
 ---
 
-## What this does
+## What this does (High-Level Overview)
 
-Drives H100 Tensor Cores directly using the WMMA API (`nvcuda::wmma`).
-Each **warp** (32 threads) operates on a fixed-size matrix fragment as a unit,
-executing a Tensor Core `mma` instruction.
-This gives access to Tensor Core throughput without the cuBLAS abstraction,
-at the cost of significant implementation complexity.
+This implementation drives the H100 Tensor Cores directly using the **Warp Matrix Multiply-Accumulate (WMMA) API**. At an abstract level, it demonstrates how to build a highly optimized, custom matrix multiplication kernel from the ground up without relying on black-box libraries like cuBLAS.
+
+The code accomplishes this through a heavily optimized pipeline:
+1. **Warp-Level Execution:** Each warp (32 threads) collaboratively loads and computes a fixed-size tile of the matrix (e.g., 16x16x16).
+2. **Multi-Stage Pipelining (Asynchronous Copies):** Instead of waiting for data to load from global memory, the kernel uses `cp.async` to pre-fetch multiple "stages" of data in the background while the Tensor Cores are busy computing the current stage.
+3. **Shared Memory Bank Conflict Padding:** Data loaded into shared memory is strategically padded to ensure that when warps read from it, they don't request data from the same memory banks simultaneously, avoiding severe pipeline stalls.
+4. **L2 Cache Swizzling:** The thread blocks are scheduled in a 2D "swizzled" panel pattern (rather than a simple row-by-row sequence). This ensures that blocks computing adjacent output tiles run concurrently, maximizing data reuse in the GPU's L2 cache and drastically reducing memory bandwidth pressure.
+5. **Precision Profiling:** It specifically contrasts the performance of **BF16** (2 bytes per element) and **TF32** (4 bytes per element) to demonstrate how bandwidth and shared memory capacity limit Tensor Core throughput.
 
 ---
 

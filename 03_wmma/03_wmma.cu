@@ -75,8 +75,21 @@ template <int N_GROUPS> __device__ __forceinline__ void cp_async_wait() {
 __global__ void wmma_bf16(const __nv_bfloat16 *__restrict__ A,
                           const __nv_bfloat16 *__restrict__ B,
                           float *__restrict__ C, int N) {
-  const int bRow = blockIdx.y * BF16_BLOCK_M;
-  const int bCol = blockIdx.x * BF16_BLOCK_N;
+  // L2 Cache Swizzling (Group 8 blocks together)
+  const int SWIZZLE = 8;
+  const int grid_x = gridDim.x;
+  const int block_idx = blockIdx.x + blockIdx.y * gridDim.x;
+  const int swizzled_idx = block_idx / SWIZZLE;
+  const int swizzled_rem = block_idx % SWIZZLE;
+  
+  const int panel_idx = swizzled_idx * SWIZZLE;
+  const int panel_width = min(SWIZZLE, grid_x - panel_idx);
+  
+  const int bCol_idx = panel_idx + (swizzled_rem % panel_width);
+  const int bRow_idx = (swizzled_idx * SWIZZLE + swizzled_rem) / grid_x;
+
+  const int bRow = bRow_idx * BF16_BLOCK_M;
+  const int bCol = bCol_idx * BF16_BLOCK_N;
 
   const int wid = threadIdx.x / WARP_SIZE;
   const int wRow = wid / BF16_WARPS_N; 
@@ -192,8 +205,21 @@ __global__ void wmma_bf16(const __nv_bfloat16 *__restrict__ A,
 __global__ void wmma_tf32(const float *__restrict__ A,
                           const float *__restrict__ B, float *__restrict__ C,
                           int N) {
-  const int bRow = blockIdx.y * TF32_BLOCK_M;
-  const int bCol = blockIdx.x * TF32_BLOCK_N;
+  // L2 Cache Swizzling (Group 8 blocks together)
+  const int SWIZZLE = 8;
+  const int grid_x = gridDim.x;
+  const int block_idx = blockIdx.x + blockIdx.y * gridDim.x;
+  const int swizzled_idx = block_idx / SWIZZLE;
+  const int swizzled_rem = block_idx % SWIZZLE;
+
+  const int panel_idx = swizzled_idx * SWIZZLE;
+  const int panel_width = min(SWIZZLE, grid_x - panel_idx);
+
+  const int bCol_idx = panel_idx + (swizzled_rem % panel_width);
+  const int bRow_idx = (swizzled_idx * SWIZZLE + swizzled_rem) / grid_x;
+
+  const int bRow = bRow_idx * TF32_BLOCK_M;
+  const int bCol = bCol_idx * TF32_BLOCK_N;
 
   const int wid = threadIdx.x / WARP_SIZE;
   const int wRow = wid / TF32_WARPS_N;
