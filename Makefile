@@ -21,16 +21,25 @@ BUILDDIR  := build
 RELEASE_FLAGS := -O3 -use_fast_math
 DEBUG_FLAGS   := -g -G -O0
 COMMON_FLAGS  := -I$(INCDIR) $(ARCH) -Xcompiler -Wall
-LDFLAGS       := -lcublas   # needed by 02_cublas; harmless for others
+LDFLAGS       := -lcublas -lcuda   # needed by 02_cublas & driver APIs
 
 # Discover all .cu files one level deep in subdirectories
 SRCS := $(wildcard */*.cu)
+
+# Omit 04_thread_block_clusters since it currently fails to build
+SRCS := $(filter-out 04_thread_block_clusters/04_thread_block_clusters.cu,$(SRCS))
 
 # Derive binary names from filenames (strip folder/ and .cu)
 BINS := $(patsubst %.cu,%,$(notdir $(SRCS)))
 
 # ── Default: release build of every target ───────────────────
 all: $(BINS)
+
+run_all: all
+	@for b in $(BINS); do \
+	    echo "\n🚀 Running $$b ..."; \
+	    ./$(BUILDDIR)/$$b || exit 1; \
+	done
 
 # Generate explicit build rules for each target
 define MAKE_TARGET
