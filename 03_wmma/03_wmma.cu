@@ -1,7 +1,7 @@
 // ============================================================
 // WMMA Tensor Core matrix multiplication benchmark
-// BF16 path : A/B = __nv_bfloat16, acc = float, tile 16×16×16
-// TF32 path : A/B = float (→tf32),  acc = float, tile 16×16×8
+// BF16 path : Optimized 128x128 double-buffered cp.async pipeline
+// TF32 path : A/B = float (→tf32), acc = float, tile 16×16×8
 // Target GPU: NVIDIA H100 (sm_90)
 // ============================================================
 
@@ -10,106 +10,190 @@
 #include <cuda_runtime.h>
 #include <math.h>
 #include <mma.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 using namespace nvcuda;
 
 // ─────────────────────────────────────────────────────────────
-// Kernel configuration
+// Shared Kernel configuration
 // ─────────────────────────────────────────────────────────────
 #define WARP_SIZE 32
 
-// BF16 WMMA tile: 16×16×16
+// BF16 WMMA tile
 #define BF16_WMMA_M 16
 #define BF16_WMMA_N 16
 #define BF16_WMMA_K 16
 
-// TF32 WMMA tile: 16×16×8
+// TF32 WMMA tile
 #define TF32_WMMA_M 16
 #define TF32_WMMA_N 16
 #define TF32_WMMA_K 8
 
-// Block warp layout: 4 rows × 4 cols = 16 warps = 512 threads
-// Block output tile: 64 × 64
-#define WARPS_M 4
-#define WARPS_N 4
-#define BLOCK_M (WARPS_M * 16)                  // 64
-#define BLOCK_N (WARPS_N * 16)                  // 64
-#define THREADS (WARPS_M * WARPS_N * WARP_SIZE) // 512
+// ==== BF16 OPTIMIZED PARAMS ====
+// Block output tile: 128 × 128
+#define BF16_BLOCK_M 128
+#define BF16_BLOCK_N 128
+#define BF16_BLOCK_K 32 // Chunk loaded per step
+#define BF16_WARPS_M 4
+#define BF16_WARPS_N 2
+#define BF16_THREADS (BF16_WARPS_M * BF16_WARPS_N * WARP_SIZE) // 256 threads (8 warps)
 
-// K chunks loaded into shmem per outer loop step
-#define BF16_BLOCK_K 64 // 4 × 16
-#define TF32_BLOCK_K 32 // 4 × 8
+// ==== TF32 PARAMS ====
+// Block output tile: 64 × 64 (keep original)
+#define TF32_BLOCK_M 64
+#define TF32_BLOCK_N 64
+#define TF32_BLOCK_K 32
+#define TF32_WARPS_M 4
+#define TF32_WARPS_N 4
+#define TF32_THREADS (TF32_WARPS_M * TF32_WARPS_N * WARP_SIZE) // 512 threads (16 warps)
 
 // ─────────────────────────────────────────────────────────────
-// BF16 WMMA Kernel
+// PTX cp.async helpers
+// ─────────────────────────────────────────────────────────────
+__device__ __forceinline__ void cp_async_16B(void* smem_ptr, const void* global_ptr, bool mask) {
+    uint32_t smem_int = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    int pred = mask ? 1 : 0;
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.b32 p, %2, 0;\n"
+        "  @p cp.async.cg.shared.global [%0], [%1], 16;\n"
+        "}\n" ::"r"(smem_int), "l"(global_ptr), "r"(pred));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ __forceinline__ void cp_async_wait() {
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+// ─────────────────────────────────────────────────────────────
+// BF16 WMMA Kernel (Optimized Pipeline)
 // ─────────────────────────────────────────────────────────────
 __global__ void wmma_bf16(const __nv_bfloat16 *__restrict__ A,
                           const __nv_bfloat16 *__restrict__ B,
                           float *__restrict__ C, int N) {
-  const int bRow = blockIdx.y * BLOCK_M;
-  const int bCol = blockIdx.x * BLOCK_N;
+  const int bRow = blockIdx.y * BF16_BLOCK_M;
+  const int bCol = blockIdx.x * BF16_BLOCK_N;
 
   const int wid = threadIdx.x / WARP_SIZE;
-  const int wRow = wid / WARPS_N;
-  const int wCol = wid % WARPS_N;
+  const int wRow = wid / BF16_WARPS_N; // 0..3
+  const int wCol = wid % BF16_WARPS_N; // 0..1
 
-  // Warp accumulator
-  wmma::fragment<wmma::accumulator, BF16_WMMA_M, BF16_WMMA_N, BF16_WMMA_K,
-                 float>
-      acc;
-  wmma::fill_fragment(acc, 0.0f);
-
-  // Shared memory tiles — single buffer (16 KB total)
-  __shared__ __nv_bfloat16 sA[BLOCK_M][BF16_BLOCK_K];
-  __shared__ __nv_bfloat16 sB[BF16_BLOCK_K][BLOCK_N];
-
-  const int tid = threadIdx.x;
-  const int kSteps = (N + BF16_BLOCK_K - 1) / BF16_BLOCK_K;
-
-  for (int ks = 0; ks < kSteps; ks++) {
-    const int kBase = ks * BF16_BLOCK_K;
-
-    // ── Cooperatively load A tile [BLOCK_M × BF16_BLOCK_K] ──
-    for (int i = tid; i < BLOCK_M * BF16_BLOCK_K; i += THREADS) {
-      int lm = i / BF16_BLOCK_K, lk = i % BF16_BLOCK_K;
-      int gm = bRow + lm, gk = kBase + lk;
-      sA[lm][lk] = (gm < N && gk < N) ? A[gm * N + gk] : __float2bfloat16(0.0f);
+  // Accumulators (2x4 array per warp to cover 32x64 output)
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
+  #pragma unroll
+  for(int i=0; i<2; i++) {
+    #pragma unroll
+    for(int j=0; j<4; j++) {
+      wmma::fill_fragment(acc[i][j], 0.0f);
     }
-
-    // ── Cooperatively load B tile [BF16_BLOCK_K × BLOCK_N] ──
-    for (int i = tid; i < BF16_BLOCK_K * BLOCK_N; i += THREADS) {
-      int lk = i / BLOCK_N, ln = i % BLOCK_N;
-      int gk = kBase + lk, gn = bCol + ln;
-      sB[lk][ln] = (gk < N && gn < N) ? B[gk * N + gn] : __float2bfloat16(0.0f);
-    }
-
-    __syncthreads();
-
-    // ── Inner K loop: 4 WMMA ops per warp over loaded tile ──
-    wmma::fragment<wmma::matrix_a, BF16_WMMA_M, BF16_WMMA_N, BF16_WMMA_K,
-                   __nv_bfloat16, wmma::row_major>
-        aFrag;
-    wmma::fragment<wmma::matrix_b, BF16_WMMA_M, BF16_WMMA_N, BF16_WMMA_K,
-                   __nv_bfloat16, wmma::row_major>
-        bFrag;
-
-#pragma unroll
-    for (int ki = 0; ki < BF16_BLOCK_K; ki += BF16_WMMA_K) {
-      wmma::load_matrix_sync(aFrag, &sA[wRow * BF16_WMMA_M][ki], BF16_BLOCK_K);
-      wmma::load_matrix_sync(bFrag, &sB[ki][wCol * BF16_WMMA_N], BLOCK_N);
-      wmma::mma_sync(acc, aFrag, bFrag, acc);
-    }
-
-    __syncthreads();
   }
 
-  // ── Store accumulator ─────────────────────────────────────
-  const int cRow = bRow + wRow * BF16_WMMA_M;
-  const int cCol = bCol + wCol * BF16_WMMA_N;
-  if (cRow < N && cCol < N)
-    wmma::store_matrix_sync(C + cRow * N + cCol, acc, N, wmma::mem_row_major);
+  // Double-buffered shared memory
+  __shared__ __align__(16) __nv_bfloat16 sA[2][BF16_BLOCK_M][BF16_BLOCK_K];
+  __shared__ __align__(16) __nv_bfloat16 sB[2][BF16_BLOCK_K][BF16_BLOCK_N];
+
+  const int tid = threadIdx.x;
+  
+  // Helper to load async stage into shared mem
+  auto load_stage = [&](int stage, int kBase) {
+      // Load A (128x32 = 4096 elements = 512 chunks of 16 bytes). 
+      // Threads = 256, so 2 chunks per thread.
+      #pragma unroll
+      for (int i = 0; i < 2; i++) {
+          int chunk_idx = tid + i * BF16_THREADS;
+          int elem_idx = chunk_idx * 8; // 8 x BF16 = 16 bytes
+          int lm = elem_idx / BF16_BLOCK_K;
+          int lk = elem_idx % BF16_BLOCK_K;
+          int gm = bRow + lm;
+          int gk = kBase + lk;
+          bool mask = (gm < N && gk < N);
+          cp_async_16B(&sA[stage][lm][lk], &A[gm * N + gk], mask);
+      }
+      
+      // Load B (32x128 = 4096 elements). Same, 2 chunks per thread.
+      #pragma unroll
+      for (int i = 0; i < 2; i++) {
+          int chunk_idx = tid + i * BF16_THREADS;
+          int elem_idx = chunk_idx * 8;
+          int lk = elem_idx / BF16_BLOCK_N;
+          int ln = elem_idx % BF16_BLOCK_N;
+          int gk = kBase + lk;
+          int gn = bCol + ln;
+          bool mask = (gk < N && gn < N);
+          cp_async_16B(&sB[stage][lk][ln], &B[gk * N + gn], mask);
+      }
+      cp_async_commit();
+  };
+
+  const int kSteps = (N + BF16_BLOCK_K - 1) / BF16_BLOCK_K;
+  if (kSteps == 0) return;
+
+  // 1. Prologue: Launch loads for Stage 0
+  load_stage(0, 0);
+
+  // 2. Main compute loop
+  int compute_stage = 0;
+  for (int ks = 0; ks < kSteps; ks++) {
+      int next_stage = compute_stage ^ 1;
+      
+      // Request next stage load
+      if (ks + 1 < kSteps) {
+          load_stage(next_stage, (ks + 1) * BF16_BLOCK_K);
+      }
+      
+      // Wait for CURRENT stage loads to complete
+      cp_async_wait();
+      __syncthreads();
+      
+      // Compute over current stage
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aFrag[2];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bFrag[4];
+
+      #pragma unroll
+      for (int ki = 0; ki < BF16_BLOCK_K; ki += 16) {
+          // Load 2 rows of A fragments for this warp
+          wmma::load_matrix_sync(aFrag[0], &sA[compute_stage][wRow * 32 + 0][ki], BF16_BLOCK_K);
+          wmma::load_matrix_sync(aFrag[1], &sA[compute_stage][wRow * 32 + 16][ki], BF16_BLOCK_K);
+          
+          // Load 4 columns of B fragments for this warp
+          wmma::load_matrix_sync(bFrag[0], &sB[compute_stage][ki][wCol * 64 + 0], BF16_BLOCK_N);
+          wmma::load_matrix_sync(bFrag[1], &sB[compute_stage][ki][wCol * 64 + 16], BF16_BLOCK_N);
+          wmma::load_matrix_sync(bFrag[2], &sB[compute_stage][ki][wCol * 64 + 32], BF16_BLOCK_N);
+          wmma::load_matrix_sync(bFrag[3], &sB[compute_stage][ki][wCol * 64 + 48], BF16_BLOCK_N);
+
+          // Multiply-accumulate outer product for the 2x4 tiles
+          #pragma unroll
+          for (int i = 0; i < 2; i++) {
+              #pragma unroll
+              for (int j = 0; j < 4; j++) {
+                  wmma::mma_sync(acc[i][j], aFrag[i], bFrag[j], acc[i][j]);
+              }
+          }
+      }
+      
+      // Ensure compute finishes consuming shared mem before next loop overwrites it
+      __syncthreads(); 
+      compute_stage = next_stage;
+  }
+
+  // 3. Epilogue: Store accumulators to global memory
+  #pragma unroll
+  for(int i=0; i<2; i++) {
+      #pragma unroll
+      for(int j=0; j<4; j++) {
+          int cRow = bRow + wRow * 32 + i * 16;
+          int cCol = bCol + wCol * 64 + j * 16;
+          if (cRow < N && cCol < N) {
+              wmma::store_matrix_sync(C + cRow * N + cCol, acc[i][j], N, wmma::mem_row_major);
+          }
+      }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -118,20 +202,20 @@ __global__ void wmma_bf16(const __nv_bfloat16 *__restrict__ A,
 __global__ void wmma_tf32(const float *__restrict__ A,
                           const float *__restrict__ B, float *__restrict__ C,
                           int N) {
-  const int bRow = blockIdx.y * BLOCK_M;
-  const int bCol = blockIdx.x * BLOCK_N;
+  const int bRow = blockIdx.y * TF32_BLOCK_M;
+  const int bCol = blockIdx.x * TF32_BLOCK_N;
 
   const int wid = threadIdx.x / WARP_SIZE;
-  const int wRow = wid / WARPS_N;
-  const int wCol = wid % WARPS_N;
+  const int wRow = wid / TF32_WARPS_N;
+  const int wCol = wid % TF32_WARPS_N;
 
   wmma::fragment<wmma::accumulator, TF32_WMMA_M, TF32_WMMA_N, TF32_WMMA_K,
                  float>
       acc;
   wmma::fill_fragment(acc, 0.0f);
 
-  __shared__ float sA[BLOCK_M][TF32_BLOCK_K]; // 64×32 floats = 8 KB
-  __shared__ float sB[TF32_BLOCK_K][BLOCK_N]; // 32×64 floats = 8 KB
+  __shared__ float sA[TF32_BLOCK_M][TF32_BLOCK_K]; // 64×32 floats = 8 KB
+  __shared__ float sB[TF32_BLOCK_K][TF32_BLOCK_N]; // 32×64 floats = 8 KB
 
   const int tid = threadIdx.x;
   const int kSteps = (N + TF32_BLOCK_K - 1) / TF32_BLOCK_K;
@@ -139,14 +223,14 @@ __global__ void wmma_tf32(const float *__restrict__ A,
   for (int ks = 0; ks < kSteps; ks++) {
     const int kBase = ks * TF32_BLOCK_K;
 
-    for (int i = tid; i < BLOCK_M * TF32_BLOCK_K; i += THREADS) {
+    for (int i = tid; i < TF32_BLOCK_M * TF32_BLOCK_K; i += TF32_THREADS) {
       int lm = i / TF32_BLOCK_K, lk = i % TF32_BLOCK_K;
       int gm = bRow + lm, gk = kBase + lk;
       sA[lm][lk] = (gm < N && gk < N) ? A[gm * N + gk] : 0.0f;
     }
 
-    for (int i = tid; i < TF32_BLOCK_K * BLOCK_N; i += THREADS) {
-      int lk = i / BLOCK_N, ln = i % BLOCK_N;
+    for (int i = tid; i < TF32_BLOCK_K * TF32_BLOCK_N; i += TF32_THREADS) {
+      int lk = i / TF32_BLOCK_N, ln = i % TF32_BLOCK_N;
       int gk = kBase + lk, gn = bCol + ln;
       sB[lk][ln] = (gk < N && gn < N) ? B[gk * N + gn] : 0.0f;
     }
@@ -163,7 +247,7 @@ __global__ void wmma_tf32(const float *__restrict__ A,
 #pragma unroll
     for (int ki = 0; ki < TF32_BLOCK_K; ki += TF32_WMMA_K) {
       wmma::load_matrix_sync(aFrag, &sA[wRow * TF32_WMMA_M][ki], TF32_BLOCK_K);
-      wmma::load_matrix_sync(bFrag, &sB[ki][wCol * TF32_WMMA_N], BLOCK_N);
+      wmma::load_matrix_sync(bFrag, &sB[ki][wCol * TF32_WMMA_N], TF32_BLOCK_N);
       wmma::mma_sync(acc, aFrag, bFrag, acc);
     }
 
@@ -177,7 +261,7 @@ __global__ void wmma_tf32(const float *__restrict__ A,
 }
 
 // ─────────────────────────────────────────────────────────────
-// Benchmark helper — returns average ms over `iters` launches
+// Benchmark helper
 // ─────────────────────────────────────────────────────────────
 static float bench(int warmup, int iters, void (*fn)(void *), void *arg) {
   for (int i = 0; i < warmup; i++)
@@ -199,7 +283,6 @@ static float bench(int warmup, int iters, void (*fn)(void *), void *arg) {
   return ms / iters;
 }
 
-// ── BF16 launch wrapper ──────────────────────────────────────
 struct BF16Args {
   __nv_bfloat16 *A, *B;
   float *C;
@@ -208,12 +291,11 @@ struct BF16Args {
 
 static void launch_bf16(void *p) {
   auto *a = (BF16Args *)p;
-  dim3 blk(THREADS);
-  dim3 grd((a->N + BLOCK_N - 1) / BLOCK_N, (a->N + BLOCK_M - 1) / BLOCK_M);
+  dim3 blk(BF16_THREADS);
+  dim3 grd((a->N + BF16_BLOCK_N - 1) / BF16_BLOCK_N, (a->N + BF16_BLOCK_M - 1) / BF16_BLOCK_M);
   wmma_bf16<<<grd, blk>>>(a->A, a->B, a->C, a->N);
 }
 
-// ── TF32 launch wrapper ──────────────────────────────────────
 struct TF32Args {
   float *A, *B, *C;
   int N;
@@ -221,14 +303,11 @@ struct TF32Args {
 
 static void launch_tf32(void *p) {
   auto *a = (TF32Args *)p;
-  dim3 blk(THREADS);
-  dim3 grd((a->N + BLOCK_N - 1) / BLOCK_N, (a->N + BLOCK_M - 1) / BLOCK_M);
+  dim3 blk(TF32_THREADS);
+  dim3 grd((a->N + TF32_BLOCK_N - 1) / TF32_BLOCK_N, (a->N + TF32_BLOCK_M - 1) / TF32_BLOCK_M);
   wmma_tf32<<<grd, blk>>>(a->A, a->B, a->C, a->N);
 }
 
-// ─────────────────────────────────────────────────────────────
-// main — sweep N, print CSV
-// ─────────────────────────────────────────────────────────────
 int main(void) {
   printDeviceInfo();
 
@@ -255,7 +334,6 @@ int main(void) {
     CUDA_CHECK(cudaMalloc(&dB32, bytes_f32));
     CUDA_CHECK(cudaMalloc(&dC32, bytes_f32));
 
-    // Initialise with random data
     {
       __nv_bfloat16 *hA16 = (__nv_bfloat16 *)malloc(bytes_bf16);
       __nv_bfloat16 *hB16 = (__nv_bfloat16 *)malloc(bytes_bf16);
@@ -280,14 +358,12 @@ int main(void) {
 
     double flops = 2.0 * (double)N * N * N;
 
-    // ── BF16 benchmark ─────────────────────────────────────
     {
       BF16Args arg = {dA16, dB16, dC16, N};
       float ms = bench(WARMUP, ITERS, launch_bf16, &arg);
       printf("BF16,%d,%.4f,%.2f\n", N, ms, flops / (ms * 1e-3) / 1e12);
     }
 
-    // ── TF32 benchmark ─────────────────────────────────────
     {
       TF32Args arg = {dA32, dB32, dC32, N};
       float ms = bench(WARMUP, ITERS, launch_tf32, &arg);
