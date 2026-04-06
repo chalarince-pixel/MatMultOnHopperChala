@@ -50,150 +50,150 @@ using namespace nvcuda;
 // ─────────────────────────────────────────────────────────────
 // PTX cp.async helpers
 // ─────────────────────────────────────────────────────────────
-__device__ __forceinline__ void cp_async_16B(void* smem_ptr, const void* global_ptr, bool mask) {
-    uint32_t smem_int = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    int pred = mask ? 1 : 0;
+__device__ __forceinline__ void copyAsync16Bytes(void* sharedPtr, const void* globalPtr, bool mask) {
+    uint32_t sharedInt = static_cast<uint32_t>(__cvta_generic_to_shared(sharedPtr));
+    int predicate = mask ? 1 : 0;
     asm volatile(
         "{\n"
         "  .reg .pred p;\n"
         "  setp.ne.b32 p, %2, 0;\n"
         "  @p cp.async.cg.shared.global [%0], [%1], 16;\n"
-        "}\n" ::"r"(smem_int), "l"(global_ptr), "r"(pred));
+        "}\n" ::"r"(sharedInt), "l"(globalPtr), "r"(predicate));
 }
 
-__device__ __forceinline__ void cp_async_commit() {
+__device__ __forceinline__ void copyAsyncCommit() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
 
-template <int N_GROUPS> __device__ __forceinline__ void cp_async_wait() {
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(N_GROUPS));
+template <int numGroups> __device__ __forceinline__ void copyAsyncWaitGroup() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(numGroups));
 }
 
 // ─────────────────────────────────────────────────────────────
 // BF16 WMMA Kernel (Optimized Pipeline)
 // ─────────────────────────────────────────────────────────────
-__global__ void wmma_bf16(const __nv_bfloat16 *__restrict__ A,
-                          const __nv_bfloat16 *__restrict__ B,
-                          float *__restrict__ C, int N) {
+__global__ void wmmaBfloat16(const __nv_bfloat16 *__restrict__ ptrA,
+                          const __nv_bfloat16 *__restrict__ ptrB,
+                          float *__restrict__ ptrC, int matrixSize) {
   // L2 Cache Swizzling (Group 8 blocks together)
-  const int SWIZZLE = 8;
-  const int grid_x = gridDim.x;
-  const int block_idx = blockIdx.x + blockIdx.y * gridDim.x;
-  const int swizzled_idx = block_idx / SWIZZLE;
-  const int swizzled_rem = block_idx % SWIZZLE;
+  const int cacheSwizzle = 8;
+  const int gridWidth = gridDim.x;
+  const int linearBlockIndex = blockIdx.x + blockIdx.y * gridDim.x;
+  const int swizzledIndex = linearBlockIndex / cacheSwizzle;
+  const int swizzledRemainder = linearBlockIndex % cacheSwizzle;
   
-  const int panel_idx = swizzled_idx * SWIZZLE;
-  const int panel_width = min(SWIZZLE, grid_x - panel_idx);
+  const int panelIndex = swizzledIndex * cacheSwizzle;
+  const int panelWidth = min(cacheSwizzle, gridWidth - panelIndex);
   
-  const int bCol_idx = panel_idx + (swizzled_rem % panel_width);
-  const int bRow_idx = (swizzled_idx * SWIZZLE + swizzled_rem) / grid_x;
+  const int blockColumnIndex = panelIndex + (swizzledRemainder % panelWidth);
+  const int blockRowIndex = (swizzledIndex * cacheSwizzle + swizzledRemainder) / gridWidth;
 
-  const int bRow = bRow_idx * BF16_BLOCK_M;
-  const int bCol = bCol_idx * BF16_BLOCK_N;
+  const int blockRow = blockRowIndex * BF16_BLOCK_M;
+  const int blockColumn = blockColumnIndex * BF16_BLOCK_N;
 
-  const int wid = threadIdx.x / WARP_SIZE;
-  const int wRow = wid / BF16_WARPS_N; 
-  const int wCol = wid % BF16_WARPS_N; 
+  const int warpId = threadIdx.x / WARP_SIZE;
+  const int warpRow = warpId / BF16_WARPS_N; 
+  const int warpColumn = warpId % BF16_WARPS_N; 
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulators[2][4];
   #pragma unroll
   for(int i=0; i<2; i++) {
     #pragma unroll
     for(int j=0; j<4; j++) {
-      wmma::fill_fragment(acc[i][j], 0.0f);
+      wmma::fill_fragment(accumulators[i][j], 0.0f);
     }
   }
 
   // Padding to avoid bank conflicts
-  __shared__ __align__(16) __nv_bfloat16 sA[PIPELINE_STAGES][BF16_BLOCK_M][BF16_BLOCK_K + 8];
-  __shared__ __align__(16) __nv_bfloat16 sB[PIPELINE_STAGES][BF16_BLOCK_K][BF16_BLOCK_N + 8];
+  __shared__ __align__(16) __nv_bfloat16 sharedA[PIPELINE_STAGES][BF16_BLOCK_M][BF16_BLOCK_K + 8];
+  __shared__ __align__(16) __nv_bfloat16 sharedB[PIPELINE_STAGES][BF16_BLOCK_K][BF16_BLOCK_N + 8];
 
-  const int tid = threadIdx.x;
+  const int threadId = threadIdx.x;
   
-  auto load_stage = [&](int stage, int kBase) {
+  auto loadStage = [&](int currentStage, int kBaseOffset) {
       #pragma unroll
       for (int i = 0; i < 2; i++) {
-          int chunk_idx = tid + i * BF16_THREADS;
-          int elem_idx = chunk_idx * 8; 
-          int lm = elem_idx / BF16_BLOCK_K;
-          int lk = elem_idx % BF16_BLOCK_K;
-          int gm = bRow + lm;
-          int gk = kBase + lk;
-          bool mask = (gm < N && gk < N);
-          cp_async_16B(&sA[stage][lm][lk], &A[gm * N + gk], mask);
+          int chunkIndex = threadId + i * BF16_THREADS;
+          int elementIndex = chunkIndex * 8; 
+          int localRow = elementIndex / BF16_BLOCK_K;
+          int localK = elementIndex % BF16_BLOCK_K;
+          int globalRow = blockRow + localRow;
+          int globalK = kBaseOffset + localK;
+          bool mask = (globalRow < matrixSize && globalK < matrixSize);
+          copyAsync16Bytes(&sharedA[currentStage][localRow][localK], &ptrA[globalRow * matrixSize + globalK], mask);
       }
       
       #pragma unroll
       for (int i = 0; i < 2; i++) {
-          int chunk_idx = tid + i * BF16_THREADS;
-          int elem_idx = chunk_idx * 8;
-          int lk = elem_idx / BF16_BLOCK_N;
-          int ln = elem_idx % BF16_BLOCK_N;
-          int gk = kBase + lk;
-          int gn = bCol + ln;
-          bool mask = (gk < N && gn < N);
-          cp_async_16B(&sB[stage][lk][ln], &B[gk * N + gn], mask);
+          int chunkIndex = threadId + i * BF16_THREADS;
+          int elementIndex = chunkIndex * 8;
+          int localK = elementIndex / BF16_BLOCK_N;
+          int localColumn = elementIndex % BF16_BLOCK_N;
+          int globalK = kBaseOffset + localK;
+          int globalColumn = blockColumn + localColumn;
+          bool mask = (globalK < matrixSize && globalColumn < matrixSize);
+          copyAsync16Bytes(&sharedB[currentStage][localK][localColumn], &ptrB[globalK * matrixSize + globalColumn], mask);
       }
-      cp_async_commit();
+      copyAsyncCommit();
   };
 
-  const int kSteps = (N + BF16_BLOCK_K - 1) / BF16_BLOCK_K;
+  const int kSteps = (matrixSize + BF16_BLOCK_K - 1) / BF16_BLOCK_K;
   if (kSteps == 0) return;
 
   // Prologue
   for (int i = 0; i < PIPELINE_STAGES - 1; i++) {
       if (i < kSteps) {
-          load_stage(i, i * BF16_BLOCK_K);
+          loadStage(i, i * BF16_BLOCK_K);
       }
   }
 
   // Main compute loop
-  int compute_stage = 0;
-  for (int ks = 0; ks < kSteps; ks++) {
-      int next_fetch_ks = ks + PIPELINE_STAGES - 1;
-      int fetch_stage = next_fetch_ks % PIPELINE_STAGES;
+  int computeStage = 0;
+  for (int step = 0; step < kSteps; step++) {
+      int nextFetchStep = step + PIPELINE_STAGES - 1;
+      int fetchStage = nextFetchStep % PIPELINE_STAGES;
       
-      if (next_fetch_ks < kSteps) {
-          load_stage(fetch_stage, next_fetch_ks * BF16_BLOCK_K);
+      if (nextFetchStep < kSteps) {
+          loadStage(fetchStage, nextFetchStep * BF16_BLOCK_K);
       }
       
-      cp_async_wait<PIPELINE_STAGES - 2>();
+      copyAsyncWaitGroup<PIPELINE_STAGES - 2>();
       __syncthreads();
       
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aFrag[2];
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bFrag[4];
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fragmentA[2];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> fragmentB[4];
 
       #pragma unroll
-      for (int ki = 0; ki < BF16_BLOCK_K; ki += 16) {
-          wmma::load_matrix_sync(aFrag[0], &sA[compute_stage][wRow * 32 + 0][ki], BF16_BLOCK_K + 8);
-          wmma::load_matrix_sync(aFrag[1], &sA[compute_stage][wRow * 32 + 16][ki], BF16_BLOCK_K + 8);
+      for (int kIndex = 0; kIndex < BF16_BLOCK_K; kIndex += 16) {
+          wmma::load_matrix_sync(fragmentA[0], &sharedA[computeStage][warpRow * 32 + 0][kIndex], BF16_BLOCK_K + 8);
+          wmma::load_matrix_sync(fragmentA[1], &sharedA[computeStage][warpRow * 32 + 16][kIndex], BF16_BLOCK_K + 8);
           
-          wmma::load_matrix_sync(bFrag[0], &sB[compute_stage][ki][wCol * 64 + 0], BF16_BLOCK_N + 8);
-          wmma::load_matrix_sync(bFrag[1], &sB[compute_stage][ki][wCol * 64 + 16], BF16_BLOCK_N + 8);
-          wmma::load_matrix_sync(bFrag[2], &sB[compute_stage][ki][wCol * 64 + 32], BF16_BLOCK_N + 8);
-          wmma::load_matrix_sync(bFrag[3], &sB[compute_stage][ki][wCol * 64 + 48], BF16_BLOCK_N + 8);
+          wmma::load_matrix_sync(fragmentB[0], &sharedB[computeStage][kIndex][warpColumn * 64 + 0], BF16_BLOCK_N + 8);
+          wmma::load_matrix_sync(fragmentB[1], &sharedB[computeStage][kIndex][warpColumn * 64 + 16], BF16_BLOCK_N + 8);
+          wmma::load_matrix_sync(fragmentB[2], &sharedB[computeStage][kIndex][warpColumn * 64 + 32], BF16_BLOCK_N + 8);
+          wmma::load_matrix_sync(fragmentB[3], &sharedB[computeStage][kIndex][warpColumn * 64 + 48], BF16_BLOCK_N + 8);
 
           #pragma unroll
           for (int i = 0; i < 2; i++) {
               #pragma unroll
               for (int j = 0; j < 4; j++) {
-                  wmma::mma_sync(acc[i][j], aFrag[i], bFrag[j], acc[i][j]);
+                  wmma::mma_sync(accumulators[i][j], fragmentA[i], fragmentB[j], accumulators[i][j]);
               }
           }
       }
       
       __syncthreads(); 
-      compute_stage = (compute_stage + 1) % PIPELINE_STAGES;
+      computeStage = (computeStage + 1) % PIPELINE_STAGES;
   }
 
   #pragma unroll
   for(int i=0; i<2; i++) {
       #pragma unroll
       for(int j=0; j<4; j++) {
-          int cRow = bRow + wRow * 32 + i * 16;
-          int cCol = bCol + wCol * 64 + j * 16;
-          if (cRow < N && cCol < N) {
-              wmma::store_matrix_sync(C + cRow * N + cCol, acc[i][j], N, wmma::mem_row_major);
+          int outputRow = blockRow + warpRow * 32 + i * 16;
+          int outputColumn = blockColumn + warpColumn * 64 + j * 16;
+          if (outputRow < matrixSize && outputColumn < matrixSize) {
+              wmma::store_matrix_sync(ptrC + outputRow * matrixSize + outputColumn, accumulators[i][j], matrixSize, wmma::mem_row_major);
           }
       }
   }
@@ -202,218 +202,218 @@ __global__ void wmma_bf16(const __nv_bfloat16 *__restrict__ A,
 // ─────────────────────────────────────────────────────────────
 // TF32 WMMA Kernel (Optimized Pipeline)
 // ─────────────────────────────────────────────────────────────
-__global__ void wmma_tf32(const float *__restrict__ A,
-                          const float *__restrict__ B, float *__restrict__ C,
-                          int N) {
+__global__ void wmmaTensorFloat32(const float *__restrict__ ptrA,
+                          const float *__restrict__ ptrB, float *__restrict__ ptrC,
+                          int matrixSize) {
   // L2 Cache Swizzling (Group 8 blocks together)
-  const int SWIZZLE = 8;
-  const int grid_x = gridDim.x;
-  const int block_idx = blockIdx.x + blockIdx.y * gridDim.x;
-  const int swizzled_idx = block_idx / SWIZZLE;
-  const int swizzled_rem = block_idx % SWIZZLE;
+  const int cacheSwizzle = 8;
+  const int gridWidth = gridDim.x;
+  const int linearBlockIndex = blockIdx.x + blockIdx.y * gridDim.x;
+  const int swizzledIndex = linearBlockIndex / cacheSwizzle;
+  const int swizzledRemainder = linearBlockIndex % cacheSwizzle;
 
-  const int panel_idx = swizzled_idx * SWIZZLE;
-  const int panel_width = min(SWIZZLE, grid_x - panel_idx);
+  const int panelIndex = swizzledIndex * cacheSwizzle;
+  const int panelWidth = min(cacheSwizzle, gridWidth - panelIndex);
 
-  const int bCol_idx = panel_idx + (swizzled_rem % panel_width);
-  const int bRow_idx = (swizzled_idx * SWIZZLE + swizzled_rem) / grid_x;
+  const int blockColumnIndex = panelIndex + (swizzledRemainder % panelWidth);
+  const int blockRowIndex = (swizzledIndex * cacheSwizzle + swizzledRemainder) / gridWidth;
 
-  const int bRow = bRow_idx * TF32_BLOCK_M;
-  const int bCol = bCol_idx * TF32_BLOCK_N;
+  const int blockRow = blockRowIndex * TF32_BLOCK_M;
+  const int blockColumn = blockColumnIndex * TF32_BLOCK_N;
 
-  const int wid = threadIdx.x / WARP_SIZE;
-  const int wRow = wid / TF32_WARPS_N;
-  const int wCol = wid % TF32_WARPS_N;
+  const int warpId = threadIdx.x / WARP_SIZE;
+  const int warpRow = warpId / TF32_WARPS_N;
+  const int warpColumn = warpId % TF32_WARPS_N;
 
-  wmma::fragment<wmma::accumulator, TF32_WMMA_M, TF32_WMMA_N, TF32_WMMA_K, float> acc;
-  wmma::fill_fragment(acc, 0.0f);
+  wmma::fragment<wmma::accumulator, TF32_WMMA_M, TF32_WMMA_N, TF32_WMMA_K, float> accumulator;
+  wmma::fill_fragment(accumulator, 0.0f);
 
-  __shared__ __align__(16) float sA[PIPELINE_STAGES][TF32_BLOCK_M][TF32_BLOCK_K + 4]; 
-  __shared__ __align__(16) float sB[PIPELINE_STAGES][TF32_BLOCK_K][TF32_BLOCK_N + 4]; 
+  __shared__ __align__(16) float sharedA[PIPELINE_STAGES][TF32_BLOCK_M][TF32_BLOCK_K + 4]; 
+  __shared__ __align__(16) float sharedB[PIPELINE_STAGES][TF32_BLOCK_K][TF32_BLOCK_N + 4]; 
 
-  const int tid = threadIdx.x;
+  const int threadId = threadIdx.x;
   
-  auto load_stage = [&](int stage, int kBase) {
+  auto loadStage = [&](int currentStage, int kBaseOffset) {
       // Load A (64x32 = 2048 floats = 512 chunks of 16 bytes). 1 chunk per thread.
-      int chunk_idx = tid;
-      int elem_idx = chunk_idx * 4; 
-      int lm = elem_idx / TF32_BLOCK_K;
-      int lk = elem_idx % TF32_BLOCK_K;
-      int gm = bRow + lm;
-      int gk = kBase + lk;
-      bool mask = (gm < N && gk < N);
-      cp_async_16B(&sA[stage][lm][lk], &A[gm * N + gk], mask);
+      int chunkIndex = threadId;
+      int elementIndex = chunkIndex * 4; 
+      int localRow = elementIndex / TF32_BLOCK_K;
+      int localK = elementIndex % TF32_BLOCK_K;
+      int globalRow = blockRow + localRow;
+      int globalK = kBaseOffset + localK;
+      bool maskA = (globalRow < matrixSize && globalK < matrixSize);
+      copyAsync16Bytes(&sharedA[currentStage][localRow][localK], &ptrA[globalRow * matrixSize + globalK], maskA);
       
       // Load B (32x64 = 2048 floats = 512 chunks of 16 bytes). 1 chunk per thread.
-      int ln = elem_idx % TF32_BLOCK_N;
-      int lk_b = elem_idx / TF32_BLOCK_N;
-      int gk_b = kBase + lk_b;
-      int gn_b = bCol + ln;
-      bool mask_b = (gk_b < N && gn_b < N);
-      cp_async_16B(&sB[stage][lk_b][ln], &B[gk_b * N + gn_b], mask_b);
+      int localColumn = elementIndex % TF32_BLOCK_N;
+      int localKForB = elementIndex / TF32_BLOCK_N;
+      int globalKForB = kBaseOffset + localKForB;
+      int globalColumnForB = blockColumn + localColumn;
+      bool maskB = (globalKForB < matrixSize && globalColumnForB < matrixSize);
+      copyAsync16Bytes(&sharedB[currentStage][localKForB][localColumn], &ptrB[globalKForB * matrixSize + globalColumnForB], maskB);
       
-      cp_async_commit();
+      copyAsyncCommit();
   };
 
-  const int kSteps = (N + TF32_BLOCK_K - 1) / TF32_BLOCK_K;
+  const int kSteps = (matrixSize + TF32_BLOCK_K - 1) / TF32_BLOCK_K;
   if(kSteps == 0) return;
 
   // Prologue
   for (int i = 0; i < PIPELINE_STAGES - 1; i++) {
-      if (i < kSteps) load_stage(i, i * TF32_BLOCK_K);
+      if (i < kSteps) loadStage(i, i * TF32_BLOCK_K);
   }
 
-  int compute_stage = 0;
-  for (int ks = 0; ks < kSteps; ks++) {
-    int next_fetch_ks = ks + PIPELINE_STAGES - 1;
-    int fetch_stage = next_fetch_ks % PIPELINE_STAGES;
+  int computeStage = 0;
+  for (int step = 0; step < kSteps; step++) {
+    int nextFetchStep = step + PIPELINE_STAGES - 1;
+    int fetchStage = nextFetchStep % PIPELINE_STAGES;
       
-    if (next_fetch_ks < kSteps) {
-        load_stage(fetch_stage, next_fetch_ks * TF32_BLOCK_K);
+    if (nextFetchStep < kSteps) {
+        loadStage(fetchStage, nextFetchStep * TF32_BLOCK_K);
     }
       
-    cp_async_wait<PIPELINE_STAGES - 2>();
+    copyAsyncWaitGroup<PIPELINE_STAGES - 2>();
     __syncthreads();
 
     wmma::fragment<wmma::matrix_a, TF32_WMMA_M, TF32_WMMA_N, TF32_WMMA_K,
-                   wmma::precision::tf32, wmma::row_major> aFrag;
+                   wmma::precision::tf32, wmma::row_major> fragmentA;
     wmma::fragment<wmma::matrix_b, TF32_WMMA_M, TF32_WMMA_N, TF32_WMMA_K,
-                   wmma::precision::tf32, wmma::row_major> bFrag;
+                   wmma::precision::tf32, wmma::row_major> fragmentB;
 
     #pragma unroll
-    for (int ki = 0; ki < TF32_BLOCK_K; ki += TF32_WMMA_K) {
-      wmma::load_matrix_sync(aFrag, &sA[compute_stage][wRow * TF32_WMMA_M][ki], TF32_BLOCK_K + 4);
-      wmma::load_matrix_sync(bFrag, &sB[compute_stage][ki][wCol * TF32_WMMA_N], TF32_BLOCK_N + 4);
-      wmma::mma_sync(acc, aFrag, bFrag, acc);
+    for (int kIndex = 0; kIndex < TF32_BLOCK_K; kIndex += TF32_WMMA_K) {
+      wmma::load_matrix_sync(fragmentA, &sharedA[computeStage][warpRow * TF32_WMMA_M][kIndex], TF32_BLOCK_K + 4);
+      wmma::load_matrix_sync(fragmentB, &sharedB[computeStage][kIndex][warpColumn * TF32_WMMA_N], TF32_BLOCK_N + 4);
+      wmma::mma_sync(accumulator, fragmentA, fragmentB, accumulator);
     }
 
     __syncthreads();
-    compute_stage = (compute_stage + 1) % PIPELINE_STAGES;
+    computeStage = (computeStage + 1) % PIPELINE_STAGES;
   }
 
-  const int cRow = bRow + wRow * TF32_WMMA_M;
-  const int cCol = bCol + wCol * TF32_WMMA_N;
-  if (cRow < N && cCol < N) {
-    wmma::store_matrix_sync(C + cRow * N + cCol, acc, N, wmma::mem_row_major);
+  const int outputRow = blockRow + warpRow * TF32_WMMA_M;
+  const int outputColumn = blockColumn + warpColumn * TF32_WMMA_N;
+  if (outputRow < matrixSize && outputColumn < matrixSize) {
+    wmma::store_matrix_sync(ptrC + outputRow * matrixSize + outputColumn, accumulator, matrixSize, wmma::mem_row_major);
   }
 }
 
 // ─────────────────────────────────────────────────────────────
 // Benchmark helper
 // ─────────────────────────────────────────────────────────────
-static float bench(int warmup, int iters, void (*fn)(void *), void *arg) {
-  for (int i = 0; i < warmup; i++)
-    fn(arg);
+static float runBenchmark(int warmupIterations, int totalIterations, void (*testFunction)(void *), void *functionArguments) {
+  for (int i = 0; i < warmupIterations; i++)
+    testFunction(functionArguments);
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  cudaEvent_t t0, t1;
-  CUDA_CHECK(cudaEventCreate(&t0));
-  CUDA_CHECK(cudaEventCreate(&t1));
-  CUDA_CHECK(cudaEventRecord(t0));
-  for (int i = 0; i < iters; i++)
-    fn(arg);
-  CUDA_CHECK(cudaEventRecord(t1));
-  CUDA_CHECK(cudaEventSynchronize(t1));
-  float ms = 0.f;
-  CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
-  cudaEventDestroy(t0);
-  cudaEventDestroy(t1);
-  return ms / iters;
+  cudaEvent_t eventStart, eventEnd;
+  CUDA_CHECK(cudaEventCreate(&eventStart));
+  CUDA_CHECK(cudaEventCreate(&eventEnd));
+  CUDA_CHECK(cudaEventRecord(eventStart));
+  for (int i = 0; i < totalIterations; i++)
+    testFunction(functionArguments);
+  CUDA_CHECK(cudaEventRecord(eventEnd));
+  CUDA_CHECK(cudaEventSynchronize(eventEnd));
+  float elapsedMilliseconds = 0.f;
+  CUDA_CHECK(cudaEventElapsedTime(&elapsedMilliseconds, eventStart, eventEnd));
+  cudaEventDestroy(eventStart);
+  cudaEventDestroy(eventEnd);
+  return elapsedMilliseconds / totalIterations;
 }
 
-struct BF16Args {
-  __nv_bfloat16 *A, *B;
-  float *C;
-  int N;
+struct BFloat16Arguments {
+  __nv_bfloat16 *ptrA, *ptrB;
+  float *ptrC;
+  int matrixSize;
 };
 
-static void launch_bf16(void *p) {
-  auto *a = (BF16Args *)p;
-  dim3 blk(BF16_THREADS);
-  dim3 grd((a->N + BF16_BLOCK_N - 1) / BF16_BLOCK_N, (a->N + BF16_BLOCK_M - 1) / BF16_BLOCK_M);
-  wmma_bf16<<<grd, blk>>>(a->A, a->B, a->C, a->N);
+static void launchBFloat16Kernel(void *parameters) {
+  auto *args = (BFloat16Arguments *)parameters;
+  dim3 blockDimensions(BF16_THREADS);
+  dim3 gridDimensions((args->matrixSize + BF16_BLOCK_N - 1) / BF16_BLOCK_N, (args->matrixSize + BF16_BLOCK_M - 1) / BF16_BLOCK_M);
+  wmmaBfloat16<<<gridDimensions, blockDimensions>>>(args->ptrA, args->ptrB, args->ptrC, args->matrixSize);
 }
 
-struct TF32Args {
-  float *A, *B, *C;
-  int N;
+struct TensorFloat32Arguments {
+  float *ptrA, *ptrB, *ptrC;
+  int matrixSize;
 };
 
-static void launch_tf32(void *p) {
-  auto *a = (TF32Args *)p;
-  dim3 blk(TF32_THREADS);
-  dim3 grd((a->N + TF32_BLOCK_N - 1) / TF32_BLOCK_N, (a->N + TF32_BLOCK_M - 1) / TF32_BLOCK_M);
-  wmma_tf32<<<grd, blk>>>(a->A, a->B, a->C, a->N);
+static void launchTensorFloat32Kernel(void *parameters) {
+  auto *args = (TensorFloat32Arguments *)parameters;
+  dim3 blockDimensions(TF32_THREADS);
+  dim3 gridDimensions((args->matrixSize + TF32_BLOCK_N - 1) / TF32_BLOCK_N, (args->matrixSize + TF32_BLOCK_M - 1) / TF32_BLOCK_M);
+  wmmaTensorFloat32<<<gridDimensions, blockDimensions>>>(args->ptrA, args->ptrB, args->ptrC, args->matrixSize);
 }
 
 int main(void) {
   printDeviceInfo();
 
-  const int SIZES[] = {32, 64, 128, 256, 512, 1024, 2048, 4096};
-  const int NSIZES = (int)(sizeof(SIZES) / sizeof(SIZES[0]));
-  const int WARMUP = 5;
-  const int ITERS = 20;
+  const int testSizes[] = {32, 64, 128, 256, 512, 1024, 2048, 4096};
+  const int numSizes = (int)(sizeof(testSizes) / sizeof(testSizes[0]));
+  const int warmupRuns = 5;
+  const int totalRuns = 20;
 
   printf("dtype,N,ms,tflops\n");
 
-  for (int si = 0; si < NSIZES; si++) {
-    int N = SIZES[si];
-    size_t bytes_bf16 = (size_t)N * N * sizeof(__nv_bfloat16);
-    size_t bytes_f32 = (size_t)N * N * sizeof(float);
+  for (int sizeIndex = 0; sizeIndex < numSizes; sizeIndex++) {
+    int matrixSize = testSizes[sizeIndex];
+    size_t memoryBytesBFloat16 = (size_t)matrixSize * matrixSize * sizeof(__nv_bfloat16);
+    size_t memoryBytesFloat32 = (size_t)matrixSize * matrixSize * sizeof(float);
 
-    __nv_bfloat16 *dA16, *dB16;
-    float *dC16;
-    float *dA32, *dB32, *dC32;
+    __nv_bfloat16 *deviceA16, *deviceB16;
+    float *deviceC16;
+    float *deviceA32, *deviceB32, *deviceC32;
 
-    CUDA_CHECK(cudaMalloc(&dA16, bytes_bf16));
-    CUDA_CHECK(cudaMalloc(&dB16, bytes_bf16));
-    CUDA_CHECK(cudaMalloc(&dC16, bytes_f32));
-    CUDA_CHECK(cudaMalloc(&dA32, bytes_f32));
-    CUDA_CHECK(cudaMalloc(&dB32, bytes_f32));
-    CUDA_CHECK(cudaMalloc(&dC32, bytes_f32));
+    CUDA_CHECK(cudaMalloc(&deviceA16, memoryBytesBFloat16));
+    CUDA_CHECK(cudaMalloc(&deviceB16, memoryBytesBFloat16));
+    CUDA_CHECK(cudaMalloc(&deviceC16, memoryBytesFloat32));
+    CUDA_CHECK(cudaMalloc(&deviceA32, memoryBytesFloat32));
+    CUDA_CHECK(cudaMalloc(&deviceB32, memoryBytesFloat32));
+    CUDA_CHECK(cudaMalloc(&deviceC32, memoryBytesFloat32));
 
     {
-      __nv_bfloat16 *hA16 = (__nv_bfloat16 *)malloc(bytes_bf16);
-      __nv_bfloat16 *hB16 = (__nv_bfloat16 *)malloc(bytes_bf16);
-      float *hA32 = (float *)malloc(bytes_f32);
-      float *hB32 = (float *)malloc(bytes_f32);
-      for (int i = 0; i < N * N; i++) {
-        float v = (float)(rand() % 10) / 10.0f;
-        hA16[i] = __float2bfloat16(v);
-        hB16[i] = __float2bfloat16(v);
-        hA32[i] = v;
-        hB32[i] = v;
+      __nv_bfloat16 *hostA16 = (__nv_bfloat16 *)malloc(memoryBytesBFloat16);
+      __nv_bfloat16 *hostB16 = (__nv_bfloat16 *)malloc(memoryBytesBFloat16);
+      float *hostA32 = (float *)malloc(memoryBytesFloat32);
+      float *hostB32 = (float *)malloc(memoryBytesFloat32);
+      for (int i = 0; i < matrixSize * matrixSize; i++) {
+        float randomValue = (float)(rand() % 10) / 10.0f;
+        hostA16[i] = __float2bfloat16(randomValue);
+        hostB16[i] = __float2bfloat16(randomValue);
+        hostA32[i] = randomValue;
+        hostB32[i] = randomValue;
       }
-      CUDA_CHECK(cudaMemcpy(dA16, hA16, bytes_bf16, cudaMemcpyHostToDevice));
-      CUDA_CHECK(cudaMemcpy(dB16, hB16, bytes_bf16, cudaMemcpyHostToDevice));
-      CUDA_CHECK(cudaMemcpy(dA32, hA32, bytes_f32, cudaMemcpyHostToDevice));
-      CUDA_CHECK(cudaMemcpy(dB32, hB32, bytes_f32, cudaMemcpyHostToDevice));
-      free(hA16);
-      free(hB16);
-      free(hA32);
-      free(hB32);
+      CUDA_CHECK(cudaMemcpy(deviceA16, hostA16, memoryBytesBFloat16, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(deviceB16, hostB16, memoryBytesBFloat16, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(deviceA32, hostA32, memoryBytesFloat32, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(deviceB32, hostB32, memoryBytesFloat32, cudaMemcpyHostToDevice));
+      free(hostA16);
+      free(hostB16);
+      free(hostA32);
+      free(hostB32);
     }
 
-    double flops = 2.0 * (double)N * N * N;
+    double floatingPointOperations = 2.0 * (double)matrixSize * matrixSize * matrixSize;
 
     {
-      BF16Args arg = {dA16, dB16, dC16, N};
-      float ms = bench(WARMUP, ITERS, launch_bf16, &arg);
-      printf("BF16,%d,%.4f,%.2f\n", N, ms, flops / (ms * 1e-3) / 1e12);
+      BFloat16Arguments functionArgs = {deviceA16, deviceB16, deviceC16, matrixSize};
+      float elapsedMilliseconds = runBenchmark(warmupRuns, totalRuns, launchBFloat16Kernel, &functionArgs);
+      printf("BF16,%d,%.4f,%.2f\n", matrixSize, elapsedMilliseconds, floatingPointOperations / (elapsedMilliseconds * 1e-3) / 1e12);
     }
 
     {
-      TF32Args arg = {dA32, dB32, dC32, N};
-      float ms = bench(WARMUP, ITERS, launch_tf32, &arg);
-      printf("FP32,%d,%.4f,%.2f\n", N, ms, flops / (ms * 1e-3) / 1e12);
+      TensorFloat32Arguments functionArgs = {deviceA32, deviceB32, deviceC32, matrixSize};
+      float elapsedMilliseconds = runBenchmark(warmupRuns, totalRuns, launchTensorFloat32Kernel, &functionArgs);
+      printf("FP32,%d,%.4f,%.2f\n", matrixSize, elapsedMilliseconds, floatingPointOperations / (elapsedMilliseconds * 1e-3) / 1e12);
     }
 
-    CUDA_CHECK(cudaFree(dA16));
-    CUDA_CHECK(cudaFree(dB16));
-    CUDA_CHECK(cudaFree(dC16));
-    CUDA_CHECK(cudaFree(dA32));
-    CUDA_CHECK(cudaFree(dB32));
-    CUDA_CHECK(cudaFree(dC32));
+    CUDA_CHECK(cudaFree(deviceA16));
+    CUDA_CHECK(cudaFree(deviceB16));
+    CUDA_CHECK(cudaFree(deviceC16));
+    CUDA_CHECK(cudaFree(deviceA32));
+    CUDA_CHECK(cudaFree(deviceB32));
+    CUDA_CHECK(cudaFree(deviceC32));
   }
 
   return 0;
