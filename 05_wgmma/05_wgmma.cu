@@ -1,7 +1,7 @@
 // ============================================================
 // WGMMA (Warpgroup Math) Matrix Multiplication Benchmark
 // Target GPU: NVIDIA H100 (sm_90a)
-// Phase 1: Warpgroup Math + cp.async pipeline
+// Warpgroup MMA + 3-stage cp.async software pipeline
 // ============================================================
 
 #include "../include/utils.cuh"
@@ -43,7 +43,6 @@ __device__ __forceinline__ void cp_async_commit() {
   asm volatile("cp.async.commit_group;\n" ::);
 }
 __device__ __forceinline__ void cp_async_wait_stage(const int N) {
-  // Wait until there are at most N uncompleted cp.async groups
   if (N == 0)
     asm volatile("cp.async.wait_group 0;\n" ::);
   else if (N == 1)
@@ -53,14 +52,10 @@ __device__ __forceinline__ void cp_async_wait_stage(const int N) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// WGMMA PTX Wrapper (m64n64k16)
+// WGMMA PTX Wrapper (m64n64k16, f32 accumulation, bf16 inputs)
 // ─────────────────────────────────────────────────────────────
 __device__ __forceinline__ void wgmma_m64n64k16(float c[32], uint64_t desc_a,
                                                 uint64_t desc_b) {
-  // wgmma instructions take exactly 32 registers for a 64x64 output block
-  // spread across the 128 threads of the warpgroup.
-  // transA = 0 (row-major), transB = 1 (row-major) since our B is row-major in
-  // memory
   asm volatile(
       "{\n"
       "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
@@ -69,13 +64,14 @@ __device__ __forceinline__ void wgmma_m64n64k16(float c[32], uint64_t desc_a,
       "%30, %31}, "
       "%32, %33, 1, 1, 1, 0, 1;\n"
       "}\n"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]),
-        "+f"(c[6]), "+f"(c[7]), "+f"(c[8]), "+f"(c[9]), "+f"(c[10]),
-        "+f"(c[11]), "+f"(c[12]), "+f"(c[13]), "+f"(c[14]), "+f"(c[15]),
-        "+f"(c[16]), "+f"(c[17]), "+f"(c[18]), "+f"(c[19]), "+f"(c[20]),
-        "+f"(c[21]), "+f"(c[22]), "+f"(c[23]), "+f"(c[24]), "+f"(c[25]),
-        "+f"(c[26]), "+f"(c[27]), "+f"(c[28]), "+f"(c[29]), "+f"(c[30]),
-        "+f"(c[31])
+      : "+f"(c[0]),  "+f"(c[1]),  "+f"(c[2]),  "+f"(c[3]),
+        "+f"(c[4]),  "+f"(c[5]),  "+f"(c[6]),  "+f"(c[7]),
+        "+f"(c[8]),  "+f"(c[9]),  "+f"(c[10]), "+f"(c[11]),
+        "+f"(c[12]), "+f"(c[13]), "+f"(c[14]), "+f"(c[15]),
+        "+f"(c[16]), "+f"(c[17]), "+f"(c[18]), "+f"(c[19]),
+        "+f"(c[20]), "+f"(c[21]), "+f"(c[22]), "+f"(c[23]),
+        "+f"(c[24]), "+f"(c[25]), "+f"(c[26]), "+f"(c[27]),
+        "+f"(c[28]), "+f"(c[29]), "+f"(c[30]), "+f"(c[31])
       : "l"(desc_a), "l"(desc_b));
 }
 __device__ __forceinline__ void wgmma_commit_group() {
@@ -91,58 +87,49 @@ __device__ __forceinline__ void wgmma_wait_group() {
 __global__ void wgmma_bf16_kernel(const __nv_bfloat16 *__restrict__ A,
                                   const __nv_bfloat16 *__restrict__ B,
                                   float *__restrict__ C, int N) {
-  // Grid mapping
   int bRow = blockIdx.y * BLOCK_M;
   int bCol = blockIdx.x * BLOCK_N;
 
-  int tid = threadIdx.x;
+  int tid    = threadIdx.x;
   int wg_idx = tid / WARPGROUP_THREADS; // 0..3
-  int wg_row = (wg_idx / 2) * 64;       // 0 or 64
-  int wg_col = (wg_idx % 2) * 64;       // 0 or 64
+  int wg_row = (wg_idx / 2) * 64;      // 0 or 64
+  int wg_col = (wg_idx % 2) * 64;      // 0 or 64
 
-  // Shared Memory allocation
   __shared__ __align__(128) __nv_bfloat16 sA[STAGES][BLOCK_M][BLOCK_K];
   __shared__ __align__(128) __nv_bfloat16 sB[STAGES][BLOCK_K][BLOCK_N];
 
-  // Accumulators
   float c[32];
 #pragma unroll
-  for (int i = 0; i < 32; i++) {
-    c[i] = 0.0f;
-  }
+  for (int i = 0; i < 32; i++) c[i] = 0.0f;
 
-  // Helper to generate WGMMA descriptor
+  // Build WGMMA shared-memory descriptor
   auto make_desc = [&](const void *smem_ptr, int lead_dim) -> uint64_t {
     uint32_t smem_int =
         static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    uint64_t desc = (smem_int & 0x3FFFF) >> 4; // bits 0-13: base address
-    uint64_t ld_shr = (lead_dim * sizeof(__nv_bfloat16)) >> 4;
-    desc |= (ld_shr << 16); // bits 16-29: leading dimension
-    desc |= (ld_shr << 32); // bits 32-45: stride
+    uint64_t desc    = (smem_int & 0x3FFFF) >> 4;
+    uint64_t ld_shr  = (lead_dim * sizeof(__nv_bfloat16)) >> 4;
+    desc |= (ld_shr << 16);
+    desc |= (ld_shr << 32);
     return desc;
   };
 
-  // Helper to load a stage
+  // Issue async loads for one pipeline stage
   auto load_stage = [&](int stage, int kBase) {
-// Load sA (128x64 = 8192 elements = 1024 chunks of 16B). 512 threads -> 2
-// chunks/thread
+    // sA: 128×64 = 8192 bf16 = 1024 × 16B. 512 threads → 2 chunks each.
 #pragma unroll
     for (int i = 0; i < 2; i++) {
       int chunk = tid + i * THREADS;
-      int elem = chunk * 8; // 8 x BF16
-      int m = elem / BLOCK_K;
-      int k = elem % BLOCK_K;
+      int elem  = chunk * 8;
+      int m = elem / BLOCK_K, k = elem % BLOCK_K;
       bool mask = (bRow + m < N && kBase + k < N);
       cp_async_16B(&sA[stage][m][k], &A[(bRow + m) * N + (kBase + k)], mask);
     }
-
-// Load sB (64x128 = 8192 elements). 2 chunks/thread
+    // sB: 64×128 = 8192 bf16 → same chunk count
 #pragma unroll
     for (int i = 0; i < 2; i++) {
       int chunk = tid + i * THREADS;
-      int elem = chunk * 8;
-      int k = elem / BLOCK_N;
-      int n = elem % BLOCK_N;
+      int elem  = chunk * 8;
+      int k = elem / BLOCK_N, n = elem % BLOCK_N;
       bool mask = (kBase + k < N && bCol + n < N);
       cp_async_16B(&sB[stage][k][n], &B[(kBase + k) * N + (bCol + n)], mask);
     }
@@ -151,26 +138,23 @@ __global__ void wgmma_bf16_kernel(const __nv_bfloat16 *__restrict__ A,
 
   int kSteps = (N + BLOCK_K - 1) / BLOCK_K;
 
-  // Prologue loads
+  // ── Prologue: fill the pipeline ──────────────────────────────
   int ks = 0;
-  for (; ks < STAGES - 1 && ks < kSteps; ks++) {
+  for (; ks < STAGES - 1 && ks < kSteps; ks++)
     load_stage(ks, ks * BLOCK_K);
-  }
 
-  // Main Loop
+  // ── Main loop ────────────────────────────────────────────────
   int compute_stage = 0;
   for (int step = 0; step < kSteps; step++) {
-    // Issue async load for future stage
     if (ks < kSteps) {
       load_stage(ks % STAGES, ks * BLOCK_K);
       ks++;
     }
 
-    // Wait for cp.async of the compute_stage to finish
     cp_async_wait_stage(STAGES - 2);
     __syncthreads();
 
-// 4 WGMMA operations per loop (k chunks of 16 out of 64)
+    // 4 WGMMA operations per K-tile (BLOCK_K/16 = 4 chunks of k=16)
 #pragma unroll
     for (int k_off = 0; k_off < BLOCK_K; k_off += 16) {
       uint64_t desc_a = make_desc(&sA[compute_stage][wg_row][k_off], BLOCK_K);
@@ -180,52 +164,37 @@ __global__ void wgmma_bf16_kernel(const __nv_bfloat16 *__restrict__ A,
     wgmma_commit_group();
     wgmma_wait_group();
 
-    // Ensure computations finish before next loop loads over this stage
     __syncthreads();
     compute_stage = (compute_stage + 1) % STAGES;
   }
 
-  // Epilogue store (Store the 32 C registers back to global memory)
-  // In WGMMA m64n64, the 128 threads of the warpgroup own specific lines of the
-  // 64x64 output tile. Thread mapping index inside warpgroup:
-  int lane = tid % 32;
-  int warp = (tid % 128) / 32;
-
+  // ── Epilogue store ────────────────────────────────────────────
+  // Simplified: accumulate registers and write a sentinel per warpgroup tile.
+  // (Full correct epilogue requires decoding the wgmma f32 register layout
+  //  or using a CUTLASS-style shared-memory transpose epilogue.)
+  int lane   = tid % 32;
   int r_base = bRow + wg_row;
   int c_base = bCol + wg_col;
-
-  // The register distribution for f32 m64n64 is:
-  // row = warp * 16 + ... (very complex swizzly distribution natively).
-  // Let's write it using a naive iterative scheme for now or look up the
-  // layout: Actually, writing it manually is prone to layout error. Usually
-  // people use CUTLASS to store it. Let's do a simplified output mapping based
-  // on standard wgmma layout. Layout: 32 f32 registers. 8 registers form a
-  // 16x16 tile piece? No, 8 registers is 32x2 bytes? Let's write the 32
-  // registers to shared memory then store. Wait, since we are purely computing
-  // TFLOPS benchmark right now, storing accurately requires deciphering the
-  // exact register layout. Let's simply write dummy values from C to global
-  // memory to prevent it being optimized out, as true TMA Epilogues are
-  // complicated.
   if (r_base < N && c_base < N) {
     float sum = 0;
 #pragma unroll
-    for (int i = 0; i < 32; i++)
-      sum += c[i];
+    for (int i = 0; i < 32; i++) sum += c[i];
     C[r_base * N + c_base + lane] = sum;
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Benchmark plumbing
+// ─────────────────────────────────────────────────────────────
 static float bench(int warmup, int iters, void (*fn)(void *), void *arg) {
-  for (int i = 0; i < warmup; i++)
-    fn(arg);
+  for (int i = 0; i < warmup; i++) fn(arg);
   CUDA_CHECK(cudaDeviceSynchronize());
 
   cudaEvent_t t0, t1;
   CUDA_CHECK(cudaEventCreate(&t0));
   CUDA_CHECK(cudaEventCreate(&t1));
   CUDA_CHECK(cudaEventRecord(t0));
-  for (int i = 0; i < iters; i++)
-    fn(arg);
+  for (int i = 0; i < iters; i++) fn(arg);
   CUDA_CHECK(cudaEventRecord(t1));
   CUDA_CHECK(cudaEventSynchronize(t1));
   float ms = 0.f;
@@ -235,11 +204,7 @@ static float bench(int warmup, int iters, void (*fn)(void *), void *arg) {
   return ms / iters;
 }
 
-struct Args {
-  __nv_bfloat16 *A, *B;
-  float *C;
-  int N;
-};
+struct Args { __nv_bfloat16 *A, *B; float *C; int N; };
 
 void launch_wgmma(void *p) {
   auto *a = (Args *)p;
@@ -251,7 +216,7 @@ void launch_wgmma(void *p) {
 int main(void) {
   printDeviceInfo();
   const int SIZES[] = {128, 256, 512, 1024, 2048, 4096, 8192};
-  const int NSIZES = sizeof(SIZES) / sizeof(SIZES[0]);
+  const int NSIZES  = sizeof(SIZES) / sizeof(SIZES[0]);
 
   printf("WGMMA BF16 Benchmark\n");
   printf("dtype,N,ms,tflops\n");
@@ -259,7 +224,7 @@ int main(void) {
   for (int si = 0; si < NSIZES; si++) {
     int N = SIZES[si];
     size_t bytes_bf16 = (size_t)N * N * sizeof(__nv_bfloat16);
-    size_t bytes_f32 = (size_t)N * N * sizeof(float);
+    size_t bytes_f32  = (size_t)N * N * sizeof(float);
 
     __nv_bfloat16 *dA, *dB;
     float *dC;

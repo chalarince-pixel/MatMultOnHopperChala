@@ -79,13 +79,26 @@ namespace cg = cooperative_groups;
 #define CLUSTER_DIM_X 1
 #define CLUSTER_DIM_Y 2
 
+// Each block stores half of A (the cluster as a whole stores all of A)
+#define A_HALF_ROWS (BLOCK_TILE_M / CLUSTER_DIM_Y) // 64
+// Padding +1 eliminates 2-way shared memory bank conflicts on A reads
+#define A_PAD 1
+
 // ─────────────────────────────────────────────────────────────
-// FP32 Cluster Kernel — high-performance thread-tiled version
+// FP32 Cluster Kernel — DSM-optimized, thread-tiled
 // ─────────────────────────────────────────────────────────────
 //
-// Each thread computes an 8×8 sub-tile of C.
-// Block tile: 128×128 output, loaded via 128×16 A-tile and 16×128 B-tile.
-// Cluster: 1×2 — rank 0 loads A from global, rank 1 reads A via DSM.
+// DSM optimization: the A-tile (128×16) is split across the
+// 1×2 cluster. Rank 0 loads rows 0-63, rank 1 loads rows 64-127.
+// During compute, each thread reads its A rows from whichever
+// block owns them — local shmem or DSM.
+//
+// Benefits over single-block A loading:
+//   • All threads in both blocks are productive during loading
+//     (rank 1 was idle before)
+//   • Total A global memory traffic is the same, but load time
+//     is halved per block (4 vs 8 elements/thread for A)
+//   • Bank conflict padding on A eliminates 2-way conflicts
 // ─────────────────────────────────────────────────────────────
 __global__ void
     clusterMatMulFP32(const float *__restrict__ inputMatrixA,
@@ -94,90 +107,88 @@ __global__ void
   cg::cluster_group clusterGroup = cg::this_cluster();
   unsigned int clusterBlockRank = clusterGroup.block_rank();
 
-  // Which 128×128 output tile does this block compute?
-  int blockTileRow = blockIdx.x; // row tile index
-  int blockTileCol = blockIdx.y; // col tile index
-
-  // Thread's position within the block
+  int blockTileRow = blockIdx.x;
+  int blockTileCol = blockIdx.y;
   int threadId = threadIdx.y * BLOCK_DIM_X + threadIdx.x;
 
-  // Shared memory tiles
-  __shared__ float sharedA[BLOCK_TILE_M][BLOCK_TILE_K]; // 128 × 16
-  __shared__ float sharedB[BLOCK_TILE_K][BLOCK_TILE_N]; // 16 × 128
+  // Each block stores HALF of A (64 rows) + padded to avoid bank conflicts
+  // Plus its own full B tile
+  __shared__ float sharedAHalf[A_HALF_ROWS][BLOCK_TILE_K + A_PAD]; // 64×17
+  __shared__ float sharedB[BLOCK_TILE_K][BLOCK_TILE_N];            // 16×128
 
-  // Thread-local accumulators: TM × TN = 8 × 8 = 64 registers
   float accumulator[THREAD_TILE_M][THREAD_TILE_N] = {};
 
-  // Which sub-tile of the output does this thread compute?
-  int threadTileRow = threadIdx.y * THREAD_TILE_M; // row offset within block tile
-  int threadTileCol = threadIdx.x * THREAD_TILE_N; // col offset within block tile
+  int threadTileRow = threadIdx.y * THREAD_TILE_M;
+  int threadTileCol = threadIdx.x * THREAD_TILE_N;
 
-  // Number of K-tiles
+  // Determine which A-half this thread's output rows fall into.
+  // threadIdx.y 0-7 → rows 0-63 (stored by rank 0)
+  // threadIdx.y 8-15 → rows 64-127 (stored by rank 1)
+  int aHalfIdx = threadTileRow / A_HALF_ROWS;           // 0 or 1
+  int aLocalRow = threadTileRow - aHalfIdx * A_HALF_ROWS; // 0-56
+
+  // Get DSM pointer to the OTHER block's A-half (stable for entire kernel)
+  const float (*aPtr)[BLOCK_TILE_K + A_PAD];
+  if (aHalfIdx == (int)clusterBlockRank) {
+    aPtr = sharedAHalf; // local — this block owns these rows
+  } else {
+    aPtr = clusterGroup.map_shared_rank(sharedAHalf, aHalfIdx); // DSM
+  }
+
   int numberOfKTiles = matrixSize / BLOCK_TILE_K;
-
-  // Precompute loading assignments — each of 256 threads loads
-  // multiple elements to fill the shared memory tiles.
-  // sharedA: 128×16 = 2048 floats, 256 threads → 8 floats/thread
-  // sharedB: 16×128 = 2048 floats, 256 threads → 8 floats/thread
+  constexpr int A_ELEMS_PER_THREAD =
+      (A_HALF_ROWS * BLOCK_TILE_K) / (BLOCK_DIM_X * BLOCK_DIM_Y); // 4
+  constexpr int B_ELEMS_PER_THREAD =
+      (BLOCK_TILE_K * BLOCK_TILE_N) / (BLOCK_DIM_X * BLOCK_DIM_Y); // 8
 
   for (int kTile = 0; kTile < numberOfKTiles; ++kTile) {
-    // ── Load A tile into shared memory ─────────────────────
-    // Only rank 0 loads A; rank 1 will read via DSM.
-    if (clusterBlockRank == 0) {
-      // Each thread loads 8 elements of A
-      int globalRowBase = blockTileRow * BLOCK_TILE_M;
+    // ── Load this block's HALF of A (64 rows) ─────────────────
+    // Rank 0 → rows [0,64), Rank 1 → rows [64,128)
+    {
+      int rowOffset = clusterBlockRank * A_HALF_ROWS;
+      int globalRowBase = blockTileRow * BLOCK_TILE_M + rowOffset;
       int globalColBase = kTile * BLOCK_TILE_K;
 #pragma unroll
-      for (int i = 0; i < (BLOCK_TILE_M * BLOCK_TILE_K) / (BLOCK_DIM_X * BLOCK_DIM_Y); ++i) {
+      for (int i = 0; i < A_ELEMS_PER_THREAD; ++i) {
         int linearIdx = threadId + i * (BLOCK_DIM_X * BLOCK_DIM_Y);
-        int localRow = linearIdx / BLOCK_TILE_K;
-        int localCol = linearIdx % BLOCK_TILE_K;
-        sharedA[localRow][localCol] =
-            inputMatrixA[(globalRowBase + localRow) * matrixSize +
-                         globalColBase + localCol];
+        int lr = linearIdx / BLOCK_TILE_K;
+        int lc = linearIdx % BLOCK_TILE_K;
+        sharedAHalf[lr][lc] =
+            inputMatrixA[(globalRowBase + lr) * matrixSize +
+                         globalColBase + lc];
       }
     }
 
-    // ── Load B tile into shared memory ─────────────────────
-    // Each block loads its own B tile (different column ranges).
+    // ── Load B tile (each block loads its own columns) ────────
     {
       int globalRowBase = kTile * BLOCK_TILE_K;
       int globalColBase = blockTileCol * BLOCK_TILE_N;
 #pragma unroll
-      for (int i = 0; i < (BLOCK_TILE_K * BLOCK_TILE_N) / (BLOCK_DIM_X * BLOCK_DIM_Y); ++i) {
+      for (int i = 0; i < B_ELEMS_PER_THREAD; ++i) {
         int linearIdx = threadId + i * (BLOCK_DIM_X * BLOCK_DIM_Y);
-        int localRow = linearIdx / BLOCK_TILE_N;
-        int localCol = linearIdx % BLOCK_TILE_N;
-        sharedB[localRow][localCol] =
-            inputMatrixB[(globalRowBase + localRow) * matrixSize +
-                         globalColBase + localCol];
+        int lr = linearIdx / BLOCK_TILE_N;
+        int lc = linearIdx % BLOCK_TILE_N;
+        sharedB[lr][lc] =
+            inputMatrixB[(globalRowBase + lr) * matrixSize +
+                         globalColBase + lc];
       }
     }
 
     __syncthreads();
     clusterGroup.sync();
 
-    // ── Get A tile pointer (DSM for rank 1) ────────────────
-    const float (*tileA)[BLOCK_TILE_K];
-    if (clusterBlockRank == 0) {
-      tileA = sharedA;
-    } else {
-      tileA = clusterGroup.map_shared_rank(sharedA, 0);
-    }
-
-    // ── Compute: each thread does TM × TN FMAs per K element ──
+    // ── Compute: outer product accumulation ───────────────────
+    // aPtr points to local or DSM A-half depending on thread's rows
 #pragma unroll
     for (int k = 0; k < BLOCK_TILE_K; ++k) {
-      // Load A column and B row into registers
       float regA[THREAD_TILE_M];
       float regB[THREAD_TILE_N];
 #pragma unroll
       for (int m = 0; m < THREAD_TILE_M; ++m)
-        regA[m] = tileA[threadTileRow + m][k];
+        regA[m] = aPtr[aLocalRow + m][k];
 #pragma unroll
       for (int n = 0; n < THREAD_TILE_N; ++n)
         regB[n] = sharedB[k][threadTileCol + n];
-      // Outer product accumulation
 #pragma unroll
       for (int m = 0; m < THREAD_TILE_M; ++m)
 #pragma unroll
@@ -189,7 +200,7 @@ __global__ void
     clusterGroup.sync();
   }
 
-  // ── Write results to global memory ─────────────────────────
+  // ── Write results ──────────────────────────────────────────
   int globalRowBase = blockTileRow * BLOCK_TILE_M + threadTileRow;
   int globalColBase = blockTileCol * BLOCK_TILE_N + threadTileCol;
 #pragma unroll
@@ -207,8 +218,7 @@ __global__ void
 }
 
 // ─────────────────────────────────────────────────────────────
-// BF16 Cluster Kernel  (loads BF16, converts to FP32 into shmem,
-//                        accumulates in FP32)
+// BF16 Cluster Kernel — DSM-optimized (BF16 load → FP32 shmem)
 // ─────────────────────────────────────────────────────────────
 __global__ void
     clusterMatMulBF16(const __nv_bfloat16 *__restrict__ inputMatrixA,
@@ -221,8 +231,7 @@ __global__ void
   int blockTileCol = blockIdx.y;
   int threadId = threadIdx.y * BLOCK_DIM_X + threadIdx.x;
 
-  // Store as float in shared memory — convert during load, not during compute
-  __shared__ float sharedA[BLOCK_TILE_M][BLOCK_TILE_K];
+  __shared__ float sharedAHalf[A_HALF_ROWS][BLOCK_TILE_K + A_PAD];
   __shared__ float sharedB[BLOCK_TILE_K][BLOCK_TILE_N];
 
   float accumulator[THREAD_TILE_M][THREAD_TILE_N] = {};
@@ -230,49 +239,56 @@ __global__ void
   int threadTileRow = threadIdx.y * THREAD_TILE_M;
   int threadTileCol = threadIdx.x * THREAD_TILE_N;
 
+  int aHalfIdx = threadTileRow / A_HALF_ROWS;
+  int aLocalRow = threadTileRow - aHalfIdx * A_HALF_ROWS;
+
+  const float (*aPtr)[BLOCK_TILE_K + A_PAD];
+  if (aHalfIdx == (int)clusterBlockRank) {
+    aPtr = sharedAHalf;
+  } else {
+    aPtr = clusterGroup.map_shared_rank(sharedAHalf, aHalfIdx);
+  }
+
   int numberOfKTiles = matrixSize / BLOCK_TILE_K;
+  constexpr int A_ELEMS_PER_THREAD =
+      (A_HALF_ROWS * BLOCK_TILE_K) / (BLOCK_DIM_X * BLOCK_DIM_Y);
+  constexpr int B_ELEMS_PER_THREAD =
+      (BLOCK_TILE_K * BLOCK_TILE_N) / (BLOCK_DIM_X * BLOCK_DIM_Y);
 
   for (int kTile = 0; kTile < numberOfKTiles; ++kTile) {
-    // Load A (BF16 → float) — only rank 0
-    if (clusterBlockRank == 0) {
-      int globalRowBase = blockTileRow * BLOCK_TILE_M;
+    // Load A half (BF16 → float)
+    {
+      int rowOffset = clusterBlockRank * A_HALF_ROWS;
+      int globalRowBase = blockTileRow * BLOCK_TILE_M + rowOffset;
       int globalColBase = kTile * BLOCK_TILE_K;
 #pragma unroll
-      for (int i = 0; i < (BLOCK_TILE_M * BLOCK_TILE_K) / (BLOCK_DIM_X * BLOCK_DIM_Y); ++i) {
+      for (int i = 0; i < A_ELEMS_PER_THREAD; ++i) {
         int linearIdx = threadId + i * (BLOCK_DIM_X * BLOCK_DIM_Y);
-        int localRow = linearIdx / BLOCK_TILE_K;
-        int localCol = linearIdx % BLOCK_TILE_K;
-        sharedA[localRow][localCol] = __bfloat162float(
-            inputMatrixA[(globalRowBase + localRow) * matrixSize +
-                         globalColBase + localCol]);
+        int lr = linearIdx / BLOCK_TILE_K;
+        int lc = linearIdx % BLOCK_TILE_K;
+        sharedAHalf[lr][lc] = __bfloat162float(
+            inputMatrixA[(globalRowBase + lr) * matrixSize +
+                         globalColBase + lc]);
       }
     }
 
-    // Load B (BF16 → float) — each block loads its own
+    // Load B (BF16 → float)
     {
       int globalRowBase = kTile * BLOCK_TILE_K;
       int globalColBase = blockTileCol * BLOCK_TILE_N;
 #pragma unroll
-      for (int i = 0; i < (BLOCK_TILE_K * BLOCK_TILE_N) / (BLOCK_DIM_X * BLOCK_DIM_Y); ++i) {
+      for (int i = 0; i < B_ELEMS_PER_THREAD; ++i) {
         int linearIdx = threadId + i * (BLOCK_DIM_X * BLOCK_DIM_Y);
-        int localRow = linearIdx / BLOCK_TILE_N;
-        int localCol = linearIdx % BLOCK_TILE_N;
-        sharedB[localRow][localCol] = __bfloat162float(
-            inputMatrixB[(globalRowBase + localRow) * matrixSize +
-                         globalColBase + localCol]);
+        int lr = linearIdx / BLOCK_TILE_N;
+        int lc = linearIdx % BLOCK_TILE_N;
+        sharedB[lr][lc] = __bfloat162float(
+            inputMatrixB[(globalRowBase + lr) * matrixSize +
+                         globalColBase + lc]);
       }
     }
 
     __syncthreads();
     clusterGroup.sync();
-
-    // Same as FP32 from here — shared memory is float
-    const float (*tileA)[BLOCK_TILE_K];
-    if (clusterBlockRank == 0) {
-      tileA = sharedA;
-    } else {
-      tileA = clusterGroup.map_shared_rank(sharedA, 0);
-    }
 
 #pragma unroll
     for (int k = 0; k < BLOCK_TILE_K; ++k) {
@@ -280,7 +296,7 @@ __global__ void
       float regB[THREAD_TILE_N];
 #pragma unroll
       for (int m = 0; m < THREAD_TILE_M; ++m)
-        regA[m] = tileA[threadTileRow + m][k];
+        regA[m] = aPtr[aLocalRow + m][k];
 #pragma unroll
       for (int n = 0; n < THREAD_TILE_N; ++n)
         regB[n] = sharedB[k][threadTileCol + n];
