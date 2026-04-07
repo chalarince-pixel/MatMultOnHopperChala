@@ -26,8 +26,7 @@ LDFLAGS       := -lcublas -lcuda   # needed by 02_cublas & driver APIs
 # Discover all .cu files one level deep in subdirectories
 SRCS := $(wildcard */*.cu)
 
-# Omit 04_thread_block_clusters since it currently fails to build
-SRCS := $(filter-out 04_thread_block_clusters/04_thread_block_clusters.cu,$(SRCS))
+# All discovered sources are now buildable
 
 # Derive binary names from filenames (strip folder/ and .cu)
 BINS := $(patsubst %.cu,%,$(notdir $(SRCS)))
