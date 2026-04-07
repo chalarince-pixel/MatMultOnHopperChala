@@ -30,11 +30,14 @@
 //
 // Approach:
 //   We use a 1×2 cluster (2 blocks along the N-column direction).
-//   Each block loads its own TILE_SIZE×TILE_SIZE tile of A and B into
-//   shared memory.  After a cluster.sync(), each block can read the
-//   neighbouring block's B-tile via DSM, so each block computes TWO
-//   output sub-tiles of C — doubling the effective B-tile width
-//   without doubling per-block shared memory.
+//   Both blocks in a cluster share the same row of tiles in A.
+//   Only block rank 0 loads the A-tile from global memory; rank 1
+//   reads it via Distributed Shared Memory — cutting A-matrix
+//   global memory traffic in half.
+//
+//   Each thread computes a THREAD_TILE_M × THREAD_TILE_N sub-tile of
+//   the output by performing THREAD_TILE_M × THREAD_TILE_N FMA ops
+//   per K-element — dramatically increasing arithmetic intensity.
 //
 //   For the FP32 path we operate on float tiles directly.
 //   For the BF16 path we load __nv_bfloat16 tiles and accumulate in float.
@@ -46,7 +49,6 @@
 
 #include "utils.cuh"
 #include <cooperative_groups.h>
-#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math.h>
@@ -56,184 +58,257 @@
 namespace cg = cooperative_groups;
 
 // ─────────────────────────────────────────────────────────────
-// cuBLAS error checking macro
-// ─────────────────────────────────────────────────────────────
-#define CUBLAS_CHECK(call)                                                     \
-  do {                                                                         \
-    cublasStatus_t status = (call);                                            \
-    if (status != CUBLAS_STATUS_SUCCESS) {                                     \
-      fprintf(stderr, "[cuBLAS ERR] %s:%d  code=%d\n", __FILE__, __LINE__,     \
-              (int)status);                                                    \
-      exit(EXIT_FAILURE);                                                      \
-    }                                                                          \
-  } while (0)
-
-// ─────────────────────────────────────────────────────────────
 // Configuration
 // ─────────────────────────────────────────────────────────────
-#define TILE_SIZE 16    // Per-block tile dimension
-#define CLUSTER_DIM_X 1 // Cluster width  (along M / row direction)
-#define CLUSTER_DIM_Y 2 // Cluster height (along N / col direction)
+
+// Block-level tile loaded into shared memory
+#define BLOCK_TILE_M 128 // rows of C per block
+#define BLOCK_TILE_N 128 // cols of C per block
+#define BLOCK_TILE_K 16  // K-dimension tile width
+
+// Thread-level tile — each thread computes TM × TN output elements
+#define THREAD_TILE_M 8
+#define THREAD_TILE_N 8
+
+// Thread block dimensions: (BLOCK_TILE_N / TN) × (BLOCK_TILE_M / TM)
+// = (128/8) × (128/8) = 16 × 16 = 256 threads
+#define BLOCK_DIM_X (BLOCK_TILE_N / THREAD_TILE_N) // 16
+#define BLOCK_DIM_Y (BLOCK_TILE_M / THREAD_TILE_M) // 16
+
+// Cluster configuration
+#define CLUSTER_DIM_X 1
+#define CLUSTER_DIM_Y 2
 
 // ─────────────────────────────────────────────────────────────
-// FP32 Cluster Kernel
+// FP32 Cluster Kernel — high-performance thread-tiled version
 // ─────────────────────────────────────────────────────────────
-// Each block in the cluster computes TILE_SIZE rows of C.
-// Via DSM each block accesses its own B-tile AND the neighbor's
-// B-tile, producing 2 sub-tiles of C (2 × TILE_SIZE columns).
 //
-// Grid is launched with half the columns (the cluster doubles output
-// width):
-//   gridDim.x = matrixSize / TILE_SIZE                          (rows)
-//   gridDim.y = matrixSize / (TILE_SIZE * CLUSTER_DIM_Y)        (column-pairs)
+// Each thread computes an 8×8 sub-tile of C.
+// Block tile: 128×128 output, loaded via 128×16 A-tile and 16×128 B-tile.
+// Cluster: 1×2 — rank 0 loads A from global, rank 1 reads A via DSM.
 // ─────────────────────────────────────────────────────────────
-__global__ void __cluster_dims__(CLUSTER_DIM_X, CLUSTER_DIM_Y, 1)
+__global__ void
     clusterMatMulFP32(const float *__restrict__ inputMatrixA,
                       const float *__restrict__ inputMatrixB,
                       float *__restrict__ outputMatrixC, int matrixSize) {
   cg::cluster_group clusterGroup = cg::this_cluster();
   unsigned int clusterBlockRank = clusterGroup.block_rank();
 
-  // Block's row-tile and column-tile indices in the output matrix
-  int tileRowIndex = blockIdx.x; // which TILE_SIZE-row stripe
+  // Which 128×128 output tile does this block compute?
+  int blockTileRow = blockIdx.x; // row tile index
+  int blockTileCol = blockIdx.y; // col tile index
 
-  // The grid's y-dimension covers column-pairs.
-  // clusterBlockRank (0 or 1) selects the sub-tile within the pair.
-  int tileColumnIndex = blockIdx.y * CLUSTER_DIM_Y + clusterBlockRank;
+  // Thread's position within the block
+  int threadId = threadIdx.y * BLOCK_DIM_X + threadIdx.x;
 
-  int threadRow = threadIdx.y;
-  int threadColumn = threadIdx.x;
+  // Shared memory tiles
+  __shared__ float sharedA[BLOCK_TILE_M][BLOCK_TILE_K]; // 128 × 16
+  __shared__ float sharedB[BLOCK_TILE_K][BLOCK_TILE_N]; // 16 × 128
 
-  // Shared memory for this block's tiles
-  __shared__ float sharedTileA[TILE_SIZE][TILE_SIZE];
-  __shared__ float sharedTileB[TILE_SIZE][TILE_SIZE];
+  // Thread-local accumulators: TM × TN = 8 × 8 = 64 registers
+  float accumulator[THREAD_TILE_M][THREAD_TILE_N] = {};
 
-  // Accumulator for THIS block's own output element
-  float accumulatorLocal = 0.0f;
+  // Which sub-tile of the output does this thread compute?
+  int threadTileRow = threadIdx.y * THREAD_TILE_M; // row offset within block tile
+  int threadTileCol = threadIdx.x * THREAD_TILE_N; // col offset within block tile
 
-  // Also accumulate for the NEIGHBOR's B-tile (DSM access)
-  float accumulatorNeighbor = 0.0f;
+  // Number of K-tiles
+  int numberOfKTiles = matrixSize / BLOCK_TILE_K;
 
-  int numberOfTiles = matrixSize / TILE_SIZE;
+  // Precompute loading assignments — each of 256 threads loads
+  // multiple elements to fill the shared memory tiles.
+  // sharedA: 128×16 = 2048 floats, 256 threads → 8 floats/thread
+  // sharedB: 16×128 = 2048 floats, 256 threads → 8 floats/thread
 
-  for (int tileIndex = 0; tileIndex < numberOfTiles; ++tileIndex) {
-    // Load A tile: row is from tileRowIndex, col iterates over k-tiles
-    int globalRowA = tileRowIndex * TILE_SIZE + threadRow;
-    int globalColumnA = tileIndex * TILE_SIZE + threadColumn;
-    sharedTileA[threadRow][threadColumn] =
-        inputMatrixA[globalRowA * matrixSize + globalColumnA];
+  for (int kTile = 0; kTile < numberOfKTiles; ++kTile) {
+    // ── Load A tile into shared memory ─────────────────────
+    // Only rank 0 loads A; rank 1 will read via DSM.
+    if (clusterBlockRank == 0) {
+      // Each thread loads 8 elements of A
+      int globalRowBase = blockTileRow * BLOCK_TILE_M;
+      int globalColBase = kTile * BLOCK_TILE_K;
+#pragma unroll
+      for (int i = 0; i < (BLOCK_TILE_M * BLOCK_TILE_K) / (BLOCK_DIM_X * BLOCK_DIM_Y); ++i) {
+        int linearIdx = threadId + i * (BLOCK_DIM_X * BLOCK_DIM_Y);
+        int localRow = linearIdx / BLOCK_TILE_K;
+        int localCol = linearIdx % BLOCK_TILE_K;
+        sharedA[localRow][localCol] =
+            inputMatrixA[(globalRowBase + localRow) * matrixSize +
+                         globalColBase + localCol];
+      }
+    }
 
-    // Load B tile: row iterates over k-tiles, col is from this block
-    int globalRowB = tileIndex * TILE_SIZE + threadRow;
-    int globalColumnB = tileColumnIndex * TILE_SIZE + threadColumn;
-    sharedTileB[threadRow][threadColumn] =
-        inputMatrixB[globalRowB * matrixSize + globalColumnB];
+    // ── Load B tile into shared memory ─────────────────────
+    // Each block loads its own B tile (different column ranges).
+    {
+      int globalRowBase = kTile * BLOCK_TILE_K;
+      int globalColBase = blockTileCol * BLOCK_TILE_N;
+#pragma unroll
+      for (int i = 0; i < (BLOCK_TILE_K * BLOCK_TILE_N) / (BLOCK_DIM_X * BLOCK_DIM_Y); ++i) {
+        int linearIdx = threadId + i * (BLOCK_DIM_X * BLOCK_DIM_Y);
+        int localRow = linearIdx / BLOCK_TILE_N;
+        int localCol = linearIdx % BLOCK_TILE_N;
+        sharedB[localRow][localCol] =
+            inputMatrixB[(globalRowBase + localRow) * matrixSize +
+                         globalColBase + localCol];
+      }
+    }
 
-    // Ensure all loads in the cluster are visible
     __syncthreads();
     clusterGroup.sync();
 
-    // ── Compute with THIS block's B-tile ─────────────────
-#pragma unroll
-    for (int kElement = 0; kElement < TILE_SIZE; ++kElement)
-      accumulatorLocal += sharedTileA[threadRow][kElement] *
-                          sharedTileB[kElement][threadColumn];
+    // ── Get A tile pointer (DSM for rank 1) ────────────────
+    const float (*tileA)[BLOCK_TILE_K];
+    if (clusterBlockRank == 0) {
+      tileA = sharedA;
+    } else {
+      tileA = clusterGroup.map_shared_rank(sharedA, 0);
+    }
 
-    // ── Compute with NEIGHBOR's B-tile via DSM ───────────
-    unsigned int neighborBlockRank = clusterBlockRank ^ 1; // flip 0↔1
-    float *neighborSharedTileB =
-        clusterGroup.map_shared_rank(sharedTileB, neighborBlockRank);
+    // ── Compute: each thread does TM × TN FMAs per K element ──
 #pragma unroll
-    for (int kElement = 0; kElement < TILE_SIZE; ++kElement)
-      accumulatorNeighbor += sharedTileA[threadRow][kElement] *
-                             neighborSharedTileB[kElement][threadColumn];
+    for (int k = 0; k < BLOCK_TILE_K; ++k) {
+      // Load A column and B row into registers
+      float regA[THREAD_TILE_M];
+      float regB[THREAD_TILE_N];
+#pragma unroll
+      for (int m = 0; m < THREAD_TILE_M; ++m)
+        regA[m] = tileA[threadTileRow + m][k];
+#pragma unroll
+      for (int n = 0; n < THREAD_TILE_N; ++n)
+        regB[n] = sharedB[k][threadTileCol + n];
+      // Outer product accumulation
+#pragma unroll
+      for (int m = 0; m < THREAD_TILE_M; ++m)
+#pragma unroll
+        for (int n = 0; n < THREAD_TILE_N; ++n)
+          accumulator[m][n] += regA[m] * regB[n];
+    }
 
     __syncthreads();
     clusterGroup.sync();
   }
 
-  // Write THIS block's result
-  int outputRow = tileRowIndex * TILE_SIZE + threadRow;
-  int outputColumn = tileColumnIndex * TILE_SIZE + threadColumn;
-  if (outputRow < matrixSize && outputColumn < matrixSize)
-    outputMatrixC[outputRow * matrixSize + outputColumn] = accumulatorLocal;
-
-  // Write NEIGHBOR's result (the column offset uses neighbor's tileColumnIndex)
-  unsigned int neighborBlockRank = clusterBlockRank ^ 1;
-  int neighborTileColumnIndex = blockIdx.y * CLUSTER_DIM_Y + neighborBlockRank;
-  int neighborOutputColumn = neighborTileColumnIndex * TILE_SIZE + threadColumn;
-  if (outputRow < matrixSize && neighborOutputColumn < matrixSize)
-    outputMatrixC[outputRow * matrixSize + neighborOutputColumn] =
-        accumulatorNeighbor;
+  // ── Write results to global memory ─────────────────────────
+  int globalRowBase = blockTileRow * BLOCK_TILE_M + threadTileRow;
+  int globalColBase = blockTileCol * BLOCK_TILE_N + threadTileCol;
+#pragma unroll
+  for (int m = 0; m < THREAD_TILE_M; ++m) {
+    int row = globalRowBase + m;
+    if (row < matrixSize) {
+#pragma unroll
+      for (int n = 0; n < THREAD_TILE_N; ++n) {
+        int col = globalColBase + n;
+        if (col < matrixSize)
+          outputMatrixC[row * matrixSize + col] = accumulator[m][n];
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
-// BF16 Cluster Kernel  (loads BF16, accumulates in FP32)
+// BF16 Cluster Kernel  (loads BF16, converts to FP32 into shmem,
+//                        accumulates in FP32)
 // ─────────────────────────────────────────────────────────────
-__global__ void __cluster_dims__(CLUSTER_DIM_X, CLUSTER_DIM_Y, 1)
+__global__ void
     clusterMatMulBF16(const __nv_bfloat16 *__restrict__ inputMatrixA,
                       const __nv_bfloat16 *__restrict__ inputMatrixB,
                       float *__restrict__ outputMatrixC, int matrixSize) {
   cg::cluster_group clusterGroup = cg::this_cluster();
   unsigned int clusterBlockRank = clusterGroup.block_rank();
 
-  int tileRowIndex = blockIdx.x;
-  int tileColumnIndex = blockIdx.y * CLUSTER_DIM_Y + clusterBlockRank;
+  int blockTileRow = blockIdx.x;
+  int blockTileCol = blockIdx.y;
+  int threadId = threadIdx.y * BLOCK_DIM_X + threadIdx.x;
 
-  int threadRow = threadIdx.y;
-  int threadColumn = threadIdx.x;
+  // Store as float in shared memory — convert during load, not during compute
+  __shared__ float sharedA[BLOCK_TILE_M][BLOCK_TILE_K];
+  __shared__ float sharedB[BLOCK_TILE_K][BLOCK_TILE_N];
 
-  __shared__ __nv_bfloat16 sharedTileA[TILE_SIZE][TILE_SIZE];
-  __shared__ __nv_bfloat16 sharedTileB[TILE_SIZE][TILE_SIZE];
+  float accumulator[THREAD_TILE_M][THREAD_TILE_N] = {};
 
-  float accumulatorLocal = 0.0f;
-  float accumulatorNeighbor = 0.0f;
+  int threadTileRow = threadIdx.y * THREAD_TILE_M;
+  int threadTileCol = threadIdx.x * THREAD_TILE_N;
 
-  int numberOfTiles = matrixSize / TILE_SIZE;
+  int numberOfKTiles = matrixSize / BLOCK_TILE_K;
 
-  for (int tileIndex = 0; tileIndex < numberOfTiles; ++tileIndex) {
-    int globalRowA = tileRowIndex * TILE_SIZE + threadRow;
-    int globalColumnA = tileIndex * TILE_SIZE + threadColumn;
-    sharedTileA[threadRow][threadColumn] =
-        inputMatrixA[globalRowA * matrixSize + globalColumnA];
+  for (int kTile = 0; kTile < numberOfKTiles; ++kTile) {
+    // Load A (BF16 → float) — only rank 0
+    if (clusterBlockRank == 0) {
+      int globalRowBase = blockTileRow * BLOCK_TILE_M;
+      int globalColBase = kTile * BLOCK_TILE_K;
+#pragma unroll
+      for (int i = 0; i < (BLOCK_TILE_M * BLOCK_TILE_K) / (BLOCK_DIM_X * BLOCK_DIM_Y); ++i) {
+        int linearIdx = threadId + i * (BLOCK_DIM_X * BLOCK_DIM_Y);
+        int localRow = linearIdx / BLOCK_TILE_K;
+        int localCol = linearIdx % BLOCK_TILE_K;
+        sharedA[localRow][localCol] = __bfloat162float(
+            inputMatrixA[(globalRowBase + localRow) * matrixSize +
+                         globalColBase + localCol]);
+      }
+    }
 
-    int globalRowB = tileIndex * TILE_SIZE + threadRow;
-    int globalColumnB = tileColumnIndex * TILE_SIZE + threadColumn;
-    sharedTileB[threadRow][threadColumn] =
-        inputMatrixB[globalRowB * matrixSize + globalColumnB];
+    // Load B (BF16 → float) — each block loads its own
+    {
+      int globalRowBase = kTile * BLOCK_TILE_K;
+      int globalColBase = blockTileCol * BLOCK_TILE_N;
+#pragma unroll
+      for (int i = 0; i < (BLOCK_TILE_K * BLOCK_TILE_N) / (BLOCK_DIM_X * BLOCK_DIM_Y); ++i) {
+        int linearIdx = threadId + i * (BLOCK_DIM_X * BLOCK_DIM_Y);
+        int localRow = linearIdx / BLOCK_TILE_N;
+        int localCol = linearIdx % BLOCK_TILE_N;
+        sharedB[localRow][localCol] = __bfloat162float(
+            inputMatrixB[(globalRowBase + localRow) * matrixSize +
+                         globalColBase + localCol]);
+      }
+    }
 
     __syncthreads();
     clusterGroup.sync();
 
-#pragma unroll
-    for (int kElement = 0; kElement < TILE_SIZE; ++kElement)
-      accumulatorLocal += __bfloat162float(sharedTileA[threadRow][kElement]) *
-                          __bfloat162float(sharedTileB[kElement][threadColumn]);
+    // Same as FP32 from here — shared memory is float
+    const float (*tileA)[BLOCK_TILE_K];
+    if (clusterBlockRank == 0) {
+      tileA = sharedA;
+    } else {
+      tileA = clusterGroup.map_shared_rank(sharedA, 0);
+    }
 
-    unsigned int neighborBlockRank = clusterBlockRank ^ 1;
-    __nv_bfloat16 *neighborSharedTileB =
-        clusterGroup.map_shared_rank(sharedTileB, neighborBlockRank);
 #pragma unroll
-    for (int kElement = 0; kElement < TILE_SIZE; ++kElement)
-      accumulatorNeighbor +=
-          __bfloat162float(sharedTileA[threadRow][kElement]) *
-          __bfloat162float(neighborSharedTileB[kElement][threadColumn]);
+    for (int k = 0; k < BLOCK_TILE_K; ++k) {
+      float regA[THREAD_TILE_M];
+      float regB[THREAD_TILE_N];
+#pragma unroll
+      for (int m = 0; m < THREAD_TILE_M; ++m)
+        regA[m] = tileA[threadTileRow + m][k];
+#pragma unroll
+      for (int n = 0; n < THREAD_TILE_N; ++n)
+        regB[n] = sharedB[k][threadTileCol + n];
+#pragma unroll
+      for (int m = 0; m < THREAD_TILE_M; ++m)
+#pragma unroll
+        for (int n = 0; n < THREAD_TILE_N; ++n)
+          accumulator[m][n] += regA[m] * regB[n];
+    }
 
     __syncthreads();
     clusterGroup.sync();
   }
 
-  int outputRow = tileRowIndex * TILE_SIZE + threadRow;
-  int outputColumn = tileColumnIndex * TILE_SIZE + threadColumn;
-  if (outputRow < matrixSize && outputColumn < matrixSize)
-    outputMatrixC[outputRow * matrixSize + outputColumn] = accumulatorLocal;
-
-  unsigned int neighborBlockRank = clusterBlockRank ^ 1;
-  int neighborTileColumnIndex = blockIdx.y * CLUSTER_DIM_Y + neighborBlockRank;
-  int neighborOutputColumn = neighborTileColumnIndex * TILE_SIZE + threadColumn;
-  if (outputRow < matrixSize && neighborOutputColumn < matrixSize)
-    outputMatrixC[outputRow * matrixSize + neighborOutputColumn] =
-        accumulatorNeighbor;
+  int globalRowBase = blockTileRow * BLOCK_TILE_M + threadTileRow;
+  int globalColBase = blockTileCol * BLOCK_TILE_N + threadTileCol;
+#pragma unroll
+  for (int m = 0; m < THREAD_TILE_M; ++m) {
+    int row = globalRowBase + m;
+    if (row < matrixSize) {
+#pragma unroll
+      for (int n = 0; n < THREAD_TILE_N; ++n) {
+        int col = globalColBase + n;
+        if (col < matrixSize)
+          outputMatrixC[row * matrixSize + col] = accumulator[m][n];
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -275,12 +350,9 @@ static void launchClusterFP32Kernel(void *parameters) {
   auto *arguments = (ClusterFP32Arguments *)parameters;
   int matrixSize = arguments->matrixSize;
 
-  dim3 blockDimensions(TILE_SIZE, TILE_SIZE);
-  // Grid: x = rows / TILE_SIZE,  y = cols / (TILE_SIZE * CLUSTER_DIM_Y)
-  dim3 gridDimensions(matrixSize / TILE_SIZE,
-                      matrixSize / (TILE_SIZE * CLUSTER_DIM_Y));
+  dim3 blockDimensions(BLOCK_DIM_X, BLOCK_DIM_Y); // 16 × 16 = 256 threads
+  dim3 gridDimensions(matrixSize / BLOCK_TILE_M, matrixSize / BLOCK_TILE_N);
 
-  // Configure cluster launch
   cudaLaunchConfig_t launchConfig = {};
   launchConfig.gridDim = gridDimensions;
   launchConfig.blockDim = blockDimensions;
@@ -307,9 +379,8 @@ static void launchClusterBF16Kernel(void *parameters) {
   auto *arguments = (ClusterBF16Arguments *)parameters;
   int matrixSize = arguments->matrixSize;
 
-  dim3 blockDimensions(TILE_SIZE, TILE_SIZE);
-  dim3 gridDimensions(matrixSize / TILE_SIZE,
-                      matrixSize / (TILE_SIZE * CLUSTER_DIM_Y));
+  dim3 blockDimensions(BLOCK_DIM_X, BLOCK_DIM_Y);
+  dim3 gridDimensions(matrixSize / BLOCK_TILE_M, matrixSize / BLOCK_TILE_N);
 
   cudaLaunchConfig_t launchConfig = {};
   launchConfig.gridDim = gridDimensions;
@@ -325,46 +396,6 @@ static void launchClusterBF16Kernel(void *parameters) {
   CUDA_CHECK(cudaLaunchKernelEx(&launchConfig, clusterMatMulBF16,
                                 arguments->inputA, arguments->inputB,
                                 arguments->outputC, matrixSize));
-}
-
-// ─────────────────────────────────────────────────────────────
-// cuBLAS reference launch wrappers
-// ─────────────────────────────────────────────────────────────
-struct CuBlasBF16Arguments {
-  cublasHandle_t cublasHandle;
-  __nv_bfloat16 *inputA, *inputB;
-  float *outputC;
-  int matrixSize;
-};
-
-static void launchCuBlasBF16Kernel(void *parameters) {
-  auto *arguments = (CuBlasBF16Arguments *)parameters;
-  const float alpha = 1.f, beta = 0.f;
-  CUBLAS_CHECK(cublasGemmEx(
-      arguments->cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, arguments->matrixSize,
-      arguments->matrixSize, arguments->matrixSize, &alpha, arguments->inputB,
-      CUDA_R_16BF, arguments->matrixSize, arguments->inputA, CUDA_R_16BF,
-      arguments->matrixSize, &beta, arguments->outputC, CUDA_R_32F,
-      arguments->matrixSize, CUBLAS_COMPUTE_32F,
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-}
-
-struct CuBlasFP32Arguments {
-  cublasHandle_t cublasHandle;
-  float *inputA, *inputB, *outputC;
-  int matrixSize;
-};
-
-static void launchCuBlasFP32Kernel(void *parameters) {
-  auto *arguments = (CuBlasFP32Arguments *)parameters;
-  const float alpha = 1.f, beta = 0.f;
-  CUBLAS_CHECK(cublasGemmEx(
-      arguments->cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, arguments->matrixSize,
-      arguments->matrixSize, arguments->matrixSize, &alpha, arguments->inputB,
-      CUDA_R_32F, arguments->matrixSize, arguments->inputA, CUDA_R_32F,
-      arguments->matrixSize, &beta, arguments->outputC, CUDA_R_32F,
-      arguments->matrixSize, CUBLAS_COMPUTE_32F_FAST_TF32,
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -407,10 +438,9 @@ static bool verifyAgainstCpuReference(const float *gpuOutputMatrix,
 int main(void) {
   printDeviceInfo();
 
-  cublasHandle_t cublasHandle;
-  CUBLAS_CHECK(cublasCreate(&cublasHandle));
-
-  const int testMatrixSizes[] = {32, 64, 128, 256, 512, 1024, 2048, 4096};
+  // Minimum: BLOCK_TILE_M * CLUSTER_DIM_Y = 256
+  // (need gridDim.y ≥ CLUSTER_DIM_Y and divisible by it)
+  const int testMatrixSizes[] = {256, 512, 1024, 2048, 4096};
   const int numberOfTestSizes =
       (int)(sizeof(testMatrixSizes) / sizeof(testMatrixSizes[0]));
   const int warmupIterations = 5;
@@ -418,9 +448,12 @@ int main(void) {
   const int verificationSizeLimit = 512;
 
   printf("============================================================\n");
-  printf("Thread Block Cluster MatMul  vs  cuBLAS\n");
-  printf("Cluster dims: %d × %d,  Tile: %d × %d\n", CLUSTER_DIM_X,
-         CLUSTER_DIM_Y, TILE_SIZE, TILE_SIZE);
+  printf("Thread Block Cluster MatMul (thread-tiled)\n");
+  printf("Block tile: %d×%d,  Thread tile: %d×%d,  K-tile: %d\n",
+         BLOCK_TILE_M, BLOCK_TILE_N, THREAD_TILE_M, THREAD_TILE_N,
+         BLOCK_TILE_K);
+  printf("Cluster dims: %d × %d,  Threads/block: %d\n", CLUSTER_DIM_X,
+         CLUSTER_DIM_Y, BLOCK_DIM_X * BLOCK_DIM_Y);
   printf("============================================================\n\n");
 
   // CSV header
@@ -436,18 +469,16 @@ int main(void) {
 
     // ── Allocate device memory ────────────────────────────
     __nv_bfloat16 *deviceInputA16, *deviceInputB16;
-    float *deviceOutputC16Cluster, *deviceOutputC16Cublas;
+    float *deviceOutputC16Cluster;
     float *deviceInputA32, *deviceInputB32;
-    float *deviceOutputC32Cluster, *deviceOutputC32Cublas;
+    float *deviceOutputC32Cluster;
 
     CUDA_CHECK(cudaMalloc(&deviceInputA16, memorySizeBFloat16));
     CUDA_CHECK(cudaMalloc(&deviceInputB16, memorySizeBFloat16));
     CUDA_CHECK(cudaMalloc(&deviceOutputC16Cluster, memorySizeFloat32));
-    CUDA_CHECK(cudaMalloc(&deviceOutputC16Cublas, memorySizeFloat32));
     CUDA_CHECK(cudaMalloc(&deviceInputA32, memorySizeFloat32));
     CUDA_CHECK(cudaMalloc(&deviceInputB32, memorySizeFloat32));
     CUDA_CHECK(cudaMalloc(&deviceOutputC32Cluster, memorySizeFloat32));
-    CUDA_CHECK(cudaMalloc(&deviceOutputC32Cublas, memorySizeFloat32));
 
     // ── Initialise with random data ──────────────────────
     {
@@ -490,19 +521,6 @@ int main(void) {
              floatingPointOperations / (elapsedMilliseconds * 1e-3) / 1e12);
     }
 
-    // ── BF16 — cuBLAS reference ───────────────────────────
-    {
-      CUDA_CHECK(cudaMemset(deviceOutputC16Cublas, 0, memorySizeFloat32));
-      CuBlasBF16Arguments kernelArguments = {cublasHandle, deviceInputA16,
-                                             deviceInputB16,
-                                             deviceOutputC16Cublas, matrixSize};
-      float elapsedMilliseconds =
-          runBenchmark(warmupIterations, benchmarkIterations,
-                       launchCuBlasBF16Kernel, &kernelArguments);
-      printf("cublas,BF16,%d,%.4f,%.2f\n", matrixSize, elapsedMilliseconds,
-             floatingPointOperations / (elapsedMilliseconds * 1e-3) / 1e12);
-    }
-
     // ── FP32 — Cluster kernel ─────────────────────────────
     {
       CUDA_CHECK(cudaMemset(deviceOutputC32Cluster, 0, memorySizeFloat32));
@@ -512,19 +530,6 @@ int main(void) {
           runBenchmark(warmupIterations, benchmarkIterations,
                        launchClusterFP32Kernel, &kernelArguments);
       printf("cluster,FP32,%d,%.4f,%.2f\n", matrixSize, elapsedMilliseconds,
-             floatingPointOperations / (elapsedMilliseconds * 1e-3) / 1e12);
-    }
-
-    // ── FP32 — cuBLAS reference ───────────────────────────
-    {
-      CUDA_CHECK(cudaMemset(deviceOutputC32Cublas, 0, memorySizeFloat32));
-      CuBlasFP32Arguments kernelArguments = {cublasHandle, deviceInputA32,
-                                             deviceInputB32,
-                                             deviceOutputC32Cublas, matrixSize};
-      float elapsedMilliseconds =
-          runBenchmark(warmupIterations, benchmarkIterations,
-                       launchCuBlasFP32Kernel, &kernelArguments);
-      printf("cublas,FP32,%d,%.4f,%.2f\n", matrixSize, elapsedMilliseconds,
              floatingPointOperations / (elapsedMilliseconds * 1e-3) / 1e12);
     }
 
@@ -557,14 +562,11 @@ int main(void) {
     CUDA_CHECK(cudaFree(deviceInputA16));
     CUDA_CHECK(cudaFree(deviceInputB16));
     CUDA_CHECK(cudaFree(deviceOutputC16Cluster));
-    CUDA_CHECK(cudaFree(deviceOutputC16Cublas));
     CUDA_CHECK(cudaFree(deviceInputA32));
     CUDA_CHECK(cudaFree(deviceInputB32));
     CUDA_CHECK(cudaFree(deviceOutputC32Cluster));
-    CUDA_CHECK(cudaFree(deviceOutputC32Cublas));
   }
 
-  CUBLAS_CHECK(cublasDestroy(cublasHandle));
   printf("\n✅  All benchmarks complete.\n");
   return 0;
 }
