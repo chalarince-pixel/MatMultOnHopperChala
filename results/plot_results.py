@@ -6,8 +6,8 @@ Usage (run on your local Mac after copying the CSVs):
     python3 plot_results.py
 
 Expects:
-    results/wmma_bench.csv    — output of ./build/03_wmma
-    results/cublas_bench.csv  — output of ./build/02_cublas
+    wmma_out.csv    — output of ./build/03_wmma
+    cublas_out.csv  — output of ./build/02_cublas
 
 Both CSVs share the same format:
     dtype,N,ms,tflops
@@ -38,8 +38,8 @@ plt.rcParams.update({
     "font.size":        11,
 })
 
-WMMA_CSV   = os.path.join("results", "wmma_bench.csv")
-CUBLAS_CSV = os.path.join("results", "cublas_bench.csv")
+WMMA_CSV   = os.path.join("results", "wmma_out.csv")
+CUBLAS_CSV = os.path.join("results", "cublas_out.csv")
 
 def load_csv(path):
     """Return dict: dtype -> {N: ms}"""
@@ -106,8 +106,8 @@ def main():
         if not os.path.exists(p):
             print(f"[ERROR] Missing file: {p}", file=sys.stderr)
             print("Run the benchmarks first:\n"
-                  "  ./build/03_wmma   > results/wmma_bench.csv\n"
-                  "  ./build/02_cublas > results/cublas_bench.csv",
+                  "  ./build/03_wmma   > wmma_out.csv\n"
+                  "  ./build/02_cublas > cublas_out.csv",
                   file=sys.stderr)
             sys.exit(1)
 
