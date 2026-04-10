@@ -119,7 +119,7 @@ __global__ void wgmma_tma_bf16_kernel(
     int ks = 0;
     for (; ks < STAGES - 1 && ks < kSteps; ks++) {
         if (is_tma_producer) {
-            cuda::device::barrier_expect_tx(mbar[ks], 32768); 
+            cuda::device::barrier_expect_tx(mbar[ks], 24576); 
             uint64_t mbar_ptr = static_cast<uint64_t>(__cvta_generic_to_shared(&mbar[ks]));
             tma_copy_2d(tmapA, static_cast<uint32_t>(__cvta_generic_to_shared(&sA[ks])), ks * BLOCK_K, bRow, mbar_ptr);
             tma_copy_2d(tmapB, static_cast<uint32_t>(__cvta_generic_to_shared(&sB[ks])), bCol, ks * BLOCK_K, mbar_ptr);
@@ -131,7 +131,7 @@ __global__ void wgmma_tma_bf16_kernel(
         
         if (ks < kSteps) {
             if (is_tma_producer) {
-                cuda::device::barrier_expect_tx(mbar[ks % STAGES], 32768); 
+                cuda::device::barrier_expect_tx(mbar[ks % STAGES], 24576); 
                 uint64_t mbar_ptr = static_cast<uint64_t>(__cvta_generic_to_shared(&mbar[ks % STAGES]));
                 tma_copy_2d(tmapA, static_cast<uint32_t>(__cvta_generic_to_shared(&sA[ks % STAGES])), ks * BLOCK_K, bRow, mbar_ptr);
                 tma_copy_2d(tmapB, static_cast<uint32_t>(__cvta_generic_to_shared(&sB[ks % STAGES])), bCol, ks * BLOCK_K, mbar_ptr);
@@ -150,7 +150,8 @@ __global__ void wgmma_tma_bf16_kernel(
         wgmma_commit_group();
         wgmma_wait_group();
 
-        mbar[compute_stage].arrive();
+        __syncthreads(); // Ensure all warpgroups have finished reading before TMA overwrites!
+
         compute_stage = (compute_stage + 1) % STAGES;
     }
 
