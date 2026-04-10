@@ -83,17 +83,51 @@ This parses the performance CSV data and generates PNG graphs comparing the impl
 
 ---
 
-## Build Commands
+## Build & Debug Commands
 
 | Command | Description |
 |---------|-------------|
 | `make` | Release build of **all** targets |
-| `make 01_tiled_shmem` | Build one specific target |
-| `make run_01_tiled_shmem` | Build + run one target |
-| `make debug` | Debug build of all targets (for cuda-gdb) |
-| `make sanitize` | Memory + race checker on all targets |
-| `make profile` | Nsight Systems profile of all targets |
-| `make clean` | Remove `build/` artifacts |
+| `make <target>` | Build one specific target (e.g., `make 01_tiled_shmem`) |
+| `make run_<target>` | Build + run one target |
+| `make clean` | Remove `build/` and profiling artifacts |
+
+## Debugging & Profiling Guide
+
+This repository includes a fully configured debugging and profiling pipeline. The required compiler flags (`-lineinfo`, `-g`, `-G`) are automatically handled by the Makefile.
+
+### 1. Correctness & Memory Debugging
+If a kernel crashes or you suspect out-of-bounds memory accesses or race conditions (common with complex Thread/Block indexing), use the `sanitize` target. This cleanly compiles the code in debug mode (`-G -g -O0`) and runs it under NVIDIA's `compute-sanitizer`.
+
+```bash
+# Run memory and race checks on all targets
+make sanitize
+```
+
+### 2. Macroscopic Profiling: Nsight Systems (`nsys`)
+To understand CPU/GPU interactions, synchronization bottlenecks, API call overheads (like `cudaMemcpy` vs kernel compute time), and overall timeline execution:
+
+```bash
+# Profile all targets
+make profile_nsys
+
+# Profile a specific target
+make profile_nsys_01_tiled_shmem
+make profile_nsys_05_wgmma
+```
+**Output:** Generates `results/<target_name>_nsys.nsys-rep`. Download this file and open it in the **Nsight Systems UI** on your local machine.
+
+### 3. Microscopic Kernel Profiling: Nsight Compute (`ncu`)
+To inspect deep kernel metrics like Tensor Core utilization, warp stalls, shared memory bank conflicts, register pressure, and L2 cache hit rates:
+
+```bash
+# Deep profile all targets (can take a while)
+make profile_ncu
+
+# Deep profile a specific target
+make profile_ncu_06_wgmma_tma
+```
+**Output:** Generates `results/<target_name>_ncu.ncu-rep`. Download this file and open it in the **Nsight Compute UI** on your local machine.
 
 ```bash
 # Build everything

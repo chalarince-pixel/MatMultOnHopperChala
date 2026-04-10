@@ -18,8 +18,8 @@ ARCH      := -arch=sm_90a
 INCDIR    := include
 BUILDDIR  := build
 
-RELEASE_FLAGS := -O3 -use_fast_math
-DEBUG_FLAGS   := -g -G -O0
+RELEASE_FLAGS := -O3 -use_fast_math -lineinfo
+DEBUG_FLAGS   := -g -G -O0 -lineinfo
 COMMON_FLAGS  := -I$(INCDIR) $(ARCH) -Xcompiler -Wall
 LDFLAGS       := -lcublas -lcuda   # needed by 02_cublas & driver APIs
 
@@ -47,7 +47,7 @@ $(2): $(1) | $$(BUILDDIR)
 	@echo "\n✅  Release build complete: $$(BUILDDIR)/$$@"
 
 debug_$(2): $(1) | $$(BUILDDIR)
-	$$(NVCC) $$(COMMON_FLAGS) $$(DEBUG_FLAGS) -o $$(BUILDDIR)/$(2)_debug $$<
+	$$(NVCC) $$(COMMON_FLAGS) $$(DEBUG_FLAGS) $$(LDFLAGS) -o $$(BUILDDIR)/$(2)_debug $$<
 	@echo "\n✅  Debug build complete: $$(BUILDDIR)/$(2)_debug"
 endef
 
@@ -69,21 +69,38 @@ sanitize: debug
 	done
 
 # ── Nsight Systems profiling ─────────────────────────────────
-profile: all
+profile_nsys: all
 	@mkdir -p results
 	@for b in $(BINS); do \
-	    echo "\n📊  Profiling $$b ..."; \
-	    nsys profile --stats=true -o results/profile_$$b $(BUILDDIR)/$$b; \
+	    echo "\n📊 CPU/GPU Timeline (nsys) for $$b ..."; \
+	    nsys profile --stats=true --force-overwrite true -o results/$${b}_nsys ./$(BUILDDIR)/$$b; \
 	done
+
+# ── Nsight Compute profiling ─────────────────────────────────
+profile_ncu: all
+	@mkdir -p results
+	@for b in $(BINS); do \
+	    echo "\n🔬 Kernel Detailed Profiling (ncu) for $$b ..."; \
+	    ncu --set full -f -o results/$${b}_ncu ./$(BUILDDIR)/$$b; \
+	done
+
+# ── Per-target profiling ─────────────────────────────────────
+profile_nsys_%: %
+	@mkdir -p results
+	nsys profile --stats=true --force-overwrite true -o results/$*_nsys ./$(BUILDDIR)/$*
+
+profile_ncu_%: %
+	@mkdir -p results
+	ncu --set full -f -o results/$*_ncu ./$(BUILDDIR)/$*
 
 # ── Helpers ───────────────────────────────────────────────────
 $(BUILDDIR):
 	@mkdir -p $@
 
 clean:
-	rm -rf $(BUILDDIR) results/*.nsys-rep results/*.sqlite
+	rm -rf $(BUILDDIR) results/*.nsys-rep results/*.sqlite results/*.ncu-rep
 
-.PHONY: all debug sanitize profile clean \
+.PHONY: all debug sanitize profile_nsys profile_ncu clean \
         $(BINS) \
         $(addprefix run_,$(BINS)) \
         $(addprefix debug_,$(BINS))
