@@ -14,12 +14,12 @@
 # ============================================================
 
 NVCC      := nvcc
-ARCH      := -arch=sm_90a
+ARCH      := -arch=compute_90a -code=sm_90a
 INCDIR    := include
 BUILDDIR  := build
 
 RELEASE_FLAGS := -O3 -use_fast_math -lineinfo
-DEBUG_FLAGS   := -g -G -O0 -lineinfo
+DEBUG_FLAGS   := -g -G -O0
 COMMON_FLAGS  := -I$(INCDIR) $(ARCH) -Xcompiler -Wall
 LDFLAGS       := -lcublas -lcuda   # needed by 02_cublas & driver APIs
 

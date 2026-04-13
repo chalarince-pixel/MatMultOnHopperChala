@@ -6,9 +6,6 @@ build/
 *.so
 
 # Profiling outputs
-results/*.nsys-rep
-results/*.sqlite
-results/*.qdrep
 
 # CUDA intermediate files
 *.cubin
