@@ -68,5 +68,5 @@ plt.grid(True, which='both', linestyle='--', linewidth=0.5)
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('/root/cuda-assignment/build/benchmark_all.png')
-print("Plot saved to /root/cuda-assignment/build/benchmark_all.png")
+plt.savefig('/home/gpu-sandbox/cuda-assignment/results/benchmark_all.png')
+print("Plot saved to /home/gpu-sandbox/cuda-assignment/results/benchmark_all.png")

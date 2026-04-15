@@ -83,9 +83,9 @@ __global__ void wgmma_tma_bf16_kernel(
 
     int tid = threadIdx.x;
     int wg_idx = tid / WARPGROUP_THREADS; 
-    int wg_row = (wg_idx / 2) * 64;       
-    int wg_col = (wg_idx % 2) * 64;       
-
+    int wg_row = (wg_idx % 2) * 64;       
+    int wg_col = (wg_idx / 2) * 64;       
+    
     __shared__ __align__(128) __nv_bfloat16 sA[STAGES][BLOCK_M][BLOCK_K];
     __shared__ __align__(128) __nv_bfloat16 sB[STAGES][BLOCK_K][BLOCK_N];
 

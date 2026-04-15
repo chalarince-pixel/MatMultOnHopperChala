@@ -63,5 +63,5 @@ plt.grid(True, which='both', linestyle='--', linewidth=0.5)
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('/root/cuda-assignment/build/benchmark_tflops.png')
+plt.savefig('/home/gpu-sandbox/cuda-assignment/results/benchmark_tflops.png')
 print("Saved TFLOPS plot!")
