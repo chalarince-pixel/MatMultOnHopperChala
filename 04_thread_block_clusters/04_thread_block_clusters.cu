@@ -100,10 +100,10 @@ namespace cg = cooperative_groups;
 //     is halved per block (4 vs 8 elements/thread for A)
 //   • Bank conflict padding on A eliminates 2-way conflicts
 // ─────────────────────────────────────────────────────────────
-__global__ void
-    clusterMatMulFP32(const float *__restrict__ inputMatrixA,
-                      const float *__restrict__ inputMatrixB,
-                      float *__restrict__ outputMatrixC, int matrixSize) {
+__global__ void clusterMatMulFP32(const float *__restrict__ inputMatrixA,
+                                  const float *__restrict__ inputMatrixB,
+                                  float *__restrict__ outputMatrixC,
+                                  int matrixSize) {
   cg::cluster_group clusterGroup = cg::this_cluster();
   unsigned int clusterBlockRank = clusterGroup.block_rank();
 
@@ -184,16 +184,20 @@ __global__ void
       float regA[THREAD_TILE_M];
       float regB[THREAD_TILE_N];
 #pragma unroll
-      for (int m = 0; m < THREAD_TILE_M; ++m)
+      for (int m = 0; m < THREAD_TILE_M; ++m) {
         regA[m] = aPtr[aLocalRow + m][k];
+      }
 #pragma unroll
-      for (int n = 0; n < THREAD_TILE_N; ++n)
+      for (int n = 0; n < THREAD_TILE_N; ++n) {
         regB[n] = sharedB[k][threadTileCol + n];
+      }
 #pragma unroll
-      for (int m = 0; m < THREAD_TILE_M; ++m)
+      for (int m = 0; m < THREAD_TILE_M; ++m) {
 #pragma unroll
-        for (int n = 0; n < THREAD_TILE_N; ++n)
+        for (int n = 0; n < THREAD_TILE_N; ++n) {
           accumulator[m][n] += regA[m] * regB[n];
+        }
+      }
     }
 
     __syncthreads();
@@ -220,10 +224,10 @@ __global__ void
 // ─────────────────────────────────────────────────────────────
 // BF16 Cluster Kernel — DSM-optimized (BF16 load → FP32 shmem)
 // ─────────────────────────────────────────────────────────────
-__global__ void
-    clusterMatMulBF16(const __nv_bfloat16 *__restrict__ inputMatrixA,
-                      const __nv_bfloat16 *__restrict__ inputMatrixB,
-                      float *__restrict__ outputMatrixC, int matrixSize) {
+__global__ void clusterMatMulBF16(const __nv_bfloat16 *__restrict__ inputMatrixA,
+                                  const __nv_bfloat16 *__restrict__ inputMatrixB,
+                                  float *__restrict__ outputMatrixC,
+                                  int matrixSize) {
   cg::cluster_group clusterGroup = cg::this_cluster();
   unsigned int clusterBlockRank = clusterGroup.block_rank();
 
@@ -295,16 +299,20 @@ __global__ void
       float regA[THREAD_TILE_M];
       float regB[THREAD_TILE_N];
 #pragma unroll
-      for (int m = 0; m < THREAD_TILE_M; ++m)
+      for (int m = 0; m < THREAD_TILE_M; ++m) {
         regA[m] = aPtr[aLocalRow + m][k];
+      }
 #pragma unroll
-      for (int n = 0; n < THREAD_TILE_N; ++n)
+      for (int n = 0; n < THREAD_TILE_N; ++n) {
         regB[n] = sharedB[k][threadTileCol + n];
+      }
 #pragma unroll
-      for (int m = 0; m < THREAD_TILE_M; ++m)
+      for (int m = 0; m < THREAD_TILE_M; ++m) {
 #pragma unroll
-        for (int n = 0; n < THREAD_TILE_N; ++n)
+        for (int n = 0; n < THREAD_TILE_N; ++n) {
           accumulator[m][n] += regA[m] * regB[n];
+        }
+      }
     }
 
     __syncthreads();
