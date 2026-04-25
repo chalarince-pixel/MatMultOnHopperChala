@@ -191,129 +191,146 @@ __global__ void wgmma_tma_cluster_kernel(
     __syncthreads();
     cluster.sync(); // CRITICAL: Ensure all mbarriers are initialized before any remote arrives are sent!
 
-    float c[32];
-    #pragma unroll
-    for (int i = 0; i < 32; i++) c[i] = 0.0f;
-
-    auto make_swizzled_desc = [&](const void* smem_ptr, int lead_dim) -> uint64_t {
-        uint32_t smem_int = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-        uint64_t desc = (smem_int & 0x3FFFF) >> 4; 
-        uint64_t ld_shr = (lead_dim * sizeof(__nv_bfloat16)) >> 4;
-        desc |= (ld_shr << 16);
-        desc |= (ld_shr << 32); 
-        desc |= (1ull << 47);    // 128B Swizzle
-        return desc;
-    };
-
-    int kSteps = (N + BLOCK_K - 1) / BLOCK_K;
-    bool is_tma_producer = (tid == 0);
-
-    // Rank 0 fetches rows 0-63, Rank 1 fetches rows 64-127
-    int a_row_base = bRow + rank * A_HALF_ROWS; 
+    int num_tiles_x = N / BLOCK_N;
+    int num_tiles_y = N / BLOCK_M;
+    int clusters_per_row = num_tiles_x / 2;
+    int clusters_per_col = num_tiles_y;
     
-    // Bytes expected: sA (128x64x2) + sB (64x64x2) = 16384 + 8192 = 24576 bytes
-    constexpr uint32_t EXPECTED_BYTES = (BLOCK_M * BLOCK_K * sizeof(__nv_bfloat16)) + 
-                                        (BLOCK_K * BLOCK_N * sizeof(__nv_bfloat16));
+    int SWIZZLE_W = 4;
+    int tile_group_size = SWIZZLE_W * SWIZZLE_W;
+    int num_groups_x = (clusters_per_row + SWIZZLE_W - 1) / SWIZZLE_W;
+    int num_groups_y = (clusters_per_col + SWIZZLE_W - 1) / SWIZZLE_W;
+    int total_work_tiles = num_groups_x * num_groups_y * tile_group_size;
+    
+    int num_clusters_grid = gridDim.x / 2;
+    int cluster_id = blockIdx.x / 2;
 
-    int ks = 0;
-    for (; ks < STAGES - 1 && ks < kSteps; ks++) {
-        if (tid == 0) cuda::device::barrier_expect_tx(mbar[ks], EXPECTED_BYTES); 
-        __syncthreads();
+    int absolute_ks = 0;
+    int absolute_step = 0;
+
+    for (int work_idx = cluster_id; work_idx < total_work_tiles; work_idx += num_clusters_grid) {
+        int group_idx = work_idx / tile_group_size;
+        int in_group_idx = work_idx % tile_group_size;
         
-        if (tid == 0) {
-            // Signal that local expect_tx is done
-            if (rank == 1) {
-                uint64_t* remote_expect = (uint64_t*)cluster.map_shared_rank(&expect_tx_mbar[ks], 0);
-                mbarrier_arrive_remote(remote_expect);
-            }
-
-            uint64_t mbar_ptr = reinterpret_cast<uint64_t>(&mbar[ks]);
-            
-            if (rank == 0) {
-                // Wait for Rank 1 to execute expect_tx
-                int expect_phase = (ks / STAGES) % 2;
-                mbarrier_wait(&expect_tx_mbar[ks], expect_phase);
-
-                // Rank 0 multicasts A to Rank 0 and Rank 1 (mask = 0b0011 = 0x3)
-                tma_copy_2d_multicast(tmapA, static_cast<uint32_t>(__cvta_generic_to_shared(&sA[ks])), ks * BLOCK_K, bRow, mbar_ptr, 0x3);
-            }
-            
-            // Both ranks fetch their own B locally
-            tma_copy_2d(tmapB, static_cast<uint32_t>(__cvta_generic_to_shared(&sB[ks])), bCol, ks * BLOCK_K, mbar_ptr);
-        }
-    }
-
-    int compute_stage = 0;
-
-    for (int step = 0; step < kSteps; step++) {
+        int group_x = group_idx % num_groups_x;
+        int group_y = group_idx / num_groups_x;
         
-        if (ks < kSteps) {
-            if (tid == 0) {
-                // Ensure Rank 1 is done reading Rank 0's A tile before Rank 0 overwrites it
-                if (ks >= STAGES && rank == 0) {
-                    int phase = ((ks - STAGES) / STAGES) % 2;
-                    mbarrier_wait(&consume_mbar[ks % STAGES], phase);
-                }
+        int c_x = group_x * SWIZZLE_W + (in_group_idx % SWIZZLE_W);
+        int c_y = group_y * SWIZZLE_W + (in_group_idx / SWIZZLE_W);
+        
+        if (c_x >= clusters_per_row || c_y >= clusters_per_col) continue;
 
-                cuda::device::barrier_expect_tx(mbar[ks % STAGES], EXPECTED_BYTES); 
-            }
+        int bCol = (c_x * 2 + rank) * BLOCK_N;
+        int bRow = c_y * BLOCK_M;
+        int a_row_base = bRow + rank * A_HALF_ROWS; 
+
+        auto make_swizzled_desc = [&](const void* smem_ptr, int lead_dim) -> uint64_t {
+            uint32_t smem_int = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+            uint64_t desc = (smem_int & 0x3FFFF) >> 4; 
+            uint64_t ld_shr = (lead_dim * sizeof(__nv_bfloat16)) >> 4;
+            desc |= (ld_shr << 16);
+            desc |= (ld_shr << 32); 
+            desc |= (1ull << 47);    // 128B Swizzle
+            return desc;
+        };
+        constexpr uint32_t EXPECTED_BYTES = (BLOCK_M * BLOCK_K * sizeof(__nv_bfloat16)) + 
+                                            (BLOCK_K * BLOCK_N * sizeof(__nv_bfloat16));
+
+        float c[32];
+        #pragma unroll
+        for (int i = 0; i < 32; i++) c[i] = 0.0f;
+
+        int kSteps = (N + BLOCK_K - 1) / BLOCK_K;
+        int tile_ks = 0;
+        
+        // Prologue
+        for (; tile_ks < STAGES - 1 && tile_ks < kSteps; tile_ks++, absolute_ks++) {
+            if (tid == 0) cuda::device::barrier_expect_tx(mbar[absolute_ks % STAGES], EXPECTED_BYTES); 
             __syncthreads();
             
             if (tid == 0) {
                 if (rank == 1) {
-                    uint64_t* remote_expect = (uint64_t*)cluster.map_shared_rank(&expect_tx_mbar[ks % STAGES], 0);
+                    uint64_t* remote_expect = (uint64_t*)cluster.map_shared_rank(&expect_tx_mbar[absolute_ks % STAGES], 0);
                     mbarrier_arrive_remote(remote_expect);
                 }
 
-                uint64_t mbar_ptr = reinterpret_cast<uint64_t>(&mbar[ks % STAGES]);
+                uint64_t mbar_ptr = reinterpret_cast<uint64_t>(&mbar[absolute_ks % STAGES]);
                 
                 if (rank == 0) {
-                    int expect_phase = (ks / STAGES) % 2;
-                    mbarrier_wait(&expect_tx_mbar[ks % STAGES], expect_phase);
-
-                    tma_copy_2d_multicast(tmapA, static_cast<uint32_t>(__cvta_generic_to_shared(&sA[ks % STAGES])), ks * BLOCK_K, bRow, mbar_ptr, 0x3);
+                    int expect_phase = (absolute_ks / STAGES) % 2;
+                    mbarrier_wait(&expect_tx_mbar[absolute_ks % STAGES], expect_phase);
+                    tma_copy_2d_multicast(tmapA, static_cast<uint32_t>(__cvta_generic_to_shared(&sA[absolute_ks % STAGES])), tile_ks * BLOCK_K, bRow, mbar_ptr, 0x3);
                 }
                 
-                tma_copy_2d(tmapB, static_cast<uint32_t>(__cvta_generic_to_shared(&sB[ks % STAGES])), bCol, ks * BLOCK_K, mbar_ptr);
-            }
-            ks++;
-        }
-
-        // Wait for TMA fetch to complete. For Rank 1, this automatically waits for Rank 0's multicast!
-        mbar[compute_stage].arrive_and_wait();
-        
-        // Compute WGMMA using strictly local memory
-        #pragma unroll
-        for (int k_off = 0; k_off < BLOCK_K; k_off += 16) {
-            uint64_t desc_a = make_swizzled_desc(&sA[compute_stage][wg_row][k_off], BLOCK_K);
-            uint64_t desc_b = make_swizzled_desc(&sB[compute_stage][k_off][0], BLOCK_N);
-            wgmma_m64n64k16(c, desc_a, desc_b);
-        }
-        wgmma_commit_group();
-        wgmma_wait_group();
-
-        __syncthreads(); // Ensure local reads are done
-        
-        if (tid == 0) {
-            if (rank == 0) {
-                mbarrier_arrive(&consume_mbar[compute_stage]); // Rank 0 arrives locally
-            } else {
-                uint64_t* remote_consume_mbar = (uint64_t*)cluster.map_shared_rank(&consume_mbar[compute_stage], 0);
-                mbarrier_arrive_remote(remote_consume_mbar); // Rank 1 arrives on Rank 0's barrier
+                tma_copy_2d(tmapB, static_cast<uint32_t>(__cvta_generic_to_shared(&sB[absolute_ks % STAGES])), bCol, tile_ks * BLOCK_K, mbar_ptr);
             }
         }
 
-        compute_stage = (compute_stage + 1) % STAGES;
-    }
+        // Main Loop
+        for (int step = 0; step < kSteps; step++, absolute_step++) {
+            
+            if (tile_ks < kSteps) {
+                if (tid == 0) {
+                    if (absolute_ks >= STAGES && rank == 0) {
+                        int phase = ((absolute_ks - STAGES) / STAGES) % 2;
+                        mbarrier_wait(&consume_mbar[absolute_ks % STAGES], phase);
+                    }
+                    cuda::device::barrier_expect_tx(mbar[absolute_ks % STAGES], EXPECTED_BYTES); 
+                }
+                __syncthreads();
+                
+                if (tid == 0) {
+                    if (rank == 1) {
+                        uint64_t* remote_expect = (uint64_t*)cluster.map_shared_rank(&expect_tx_mbar[absolute_ks % STAGES], 0);
+                        mbarrier_arrive_remote(remote_expect);
+                    }
 
-    // Dummy store
-    int lane = tid % 32;
-    int r_base = bRow + wg_row;
-    int c_base = bCol; // WG_COL is always 0 for 128x64 block
-    if (r_base < N && c_base < N && lane == 0) {
-        float sum = 0;
-        for (int i = 0; i < 32; i++) sum += c[i];
-        C[r_base * N + c_base + lane] = sum; 
+                    uint64_t mbar_ptr = reinterpret_cast<uint64_t>(&mbar[absolute_ks % STAGES]);
+                    
+                    if (rank == 0) {
+                        int expect_phase = (absolute_ks / STAGES) % 2;
+                        mbarrier_wait(&expect_tx_mbar[absolute_ks % STAGES], expect_phase);
+                        tma_copy_2d_multicast(tmapA, static_cast<uint32_t>(__cvta_generic_to_shared(&sA[absolute_ks % STAGES])), tile_ks * BLOCK_K, bRow, mbar_ptr, 0x3);
+                    }
+                    
+                    tma_copy_2d(tmapB, static_cast<uint32_t>(__cvta_generic_to_shared(&sB[absolute_ks % STAGES])), bCol, tile_ks * BLOCK_K, mbar_ptr);
+                }
+                tile_ks++;
+                absolute_ks++;
+            }
+
+            mbar[absolute_step % STAGES].arrive_and_wait();
+            
+            #pragma unroll
+            for (int k_off = 0; k_off < BLOCK_K; k_off += 16) {
+                uint64_t desc_a = make_swizzled_desc(&sA[absolute_step % STAGES][wg_row][k_off], BLOCK_K);
+                uint64_t desc_b = make_swizzled_desc(&sB[absolute_step % STAGES][k_off][0], BLOCK_N);
+                wgmma_m64n64k16(c, desc_a, desc_b);
+            }
+            wgmma_commit_group();
+            wgmma_wait_group();
+
+            __syncthreads(); 
+            
+            if (tid == 0) {
+                if (rank == 0) {
+                    mbarrier_arrive(&consume_mbar[absolute_step % STAGES]); 
+                } else {
+                    uint64_t* remote_consume_mbar = (uint64_t*)cluster.map_shared_rank(&consume_mbar[absolute_step % STAGES], 0);
+                    mbarrier_arrive_remote(remote_consume_mbar); 
+                }
+            }
+        }
+
+        // Dummy store
+        int lane = tid % 32;
+        int r_base = bRow + wg_row;
+        int c_base = bCol; 
+        if (r_base < N && c_base < N && lane == 0) {
+            float sum = 0;
+            for (int i = 0; i < 32; i++) sum += c[i];
+            C[r_base * N + c_base + lane] = sum; 
+        }
     }
 
     cluster.sync(); // CRITICAL: Ensure no block exits and destroys its shared memory before all remote mbarrier arrivals are delivered
@@ -368,8 +385,10 @@ void launch_wgmma_tma_clusters(void *p) {
     auto *a = (TMA_Args *)p;
     
     dim3 blk(THREADS);
-    // Grid must be divisible by cluster dimensions
-    dim3 grd((a->N + BLOCK_N - 1) / BLOCK_N, (a->N + BLOCK_M - 1) / BLOCK_M);
+    // Persistent thread blocks: launch 3 blocks per SM (396 blocks = 198 clusters of 2 blocks)
+    // to hide synchronization latency.
+    int num_blocks = 396;
+    dim3 grd(num_blocks, 1);
 
     cudaLaunchConfig_t config = {};
     config.gridDim = grd;
