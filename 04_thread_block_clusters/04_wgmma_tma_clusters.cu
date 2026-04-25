@@ -127,10 +127,9 @@ __device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
 }
 
 __device__ __forceinline__ void mbarrier_arrive_remote(uint64_t* mbar) {
-    uint32_t smem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
     asm volatile(
-        "mbarrier.arrive.shared::cluster.b64 _, [%0];\n"
-        :: "r"(smem_ptr)
+        "mbarrier.arrive.b64 _, [%0];\n"
+        :: "l"(mbar)
     );
 }
 
@@ -138,13 +137,13 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t* mbar, int phase) {
     uint32_t smem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
     asm volatile(
         "{\n"
-        ".reg .pred p;\n"
-        "wait_loop:\n"
-        "mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
-        "@p bra wait_done;\n"
-        "nanosleep.u32 20;\n"
-        "bra wait_loop;\n"
-        "wait_done:\n"
+        ".reg .pred                P1;\n"
+        "LAB_WAIT:\n"
+        "mbarrier.try_wait.parity.shared.b64 P1, [%0], %1;\n"
+        "   @P1 bra.uni            DONE;\n"
+        "nanosleep.u32             20;\n"
+        "bra.uni                   LAB_WAIT;\n"
+        "DONE:\n"
         "}\n"
         :: "r"(smem_ptr), "r"(phase)
     );
@@ -218,16 +217,17 @@ __global__ void wgmma_tma_cluster_kernel(
 
     int ks = 0;
     for (; ks < STAGES - 1 && ks < kSteps; ks++) {
+        if (tid == 0) cuda::device::barrier_expect_tx(mbar[ks], EXPECTED_BYTES); 
+        __syncthreads();
+        
         if (tid == 0) {
-            cuda::device::barrier_expect_tx(mbar[ks], EXPECTED_BYTES); 
-            
             // Signal that local expect_tx is done
             if (rank == 1) {
                 uint64_t* remote_expect = (uint64_t*)cluster.map_shared_rank(&expect_tx_mbar[ks], 0);
                 mbarrier_arrive_remote(remote_expect);
             }
 
-            uint64_t mbar_ptr = static_cast<uint64_t>(__cvta_generic_to_shared(&mbar[ks]));
+            uint64_t mbar_ptr = reinterpret_cast<uint64_t>(&mbar[ks]);
             
             if (rank == 0) {
                 // Wait for Rank 1 to execute expect_tx
@@ -256,13 +256,16 @@ __global__ void wgmma_tma_cluster_kernel(
                 }
 
                 cuda::device::barrier_expect_tx(mbar[ks % STAGES], EXPECTED_BYTES); 
-                
+            }
+            __syncthreads();
+            
+            if (tid == 0) {
                 if (rank == 1) {
                     uint64_t* remote_expect = (uint64_t*)cluster.map_shared_rank(&expect_tx_mbar[ks % STAGES], 0);
                     mbarrier_arrive_remote(remote_expect);
                 }
 
-                uint64_t mbar_ptr = static_cast<uint64_t>(__cvta_generic_to_shared(&mbar[ks % STAGES]));
+                uint64_t mbar_ptr = reinterpret_cast<uint64_t>(&mbar[ks % STAGES]);
                 
                 if (rank == 0) {
                     int expect_phase = (ks / STAGES) % 2;
@@ -312,6 +315,8 @@ __global__ void wgmma_tma_cluster_kernel(
         for (int i = 0; i < 32; i++) sum += c[i];
         C[r_base * N + c_base + lane] = sum; 
     }
+
+    cluster.sync(); // CRITICAL: Ensure no block exits and destroys its shared memory before all remote mbarrier arrivals are delivered
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -385,7 +390,7 @@ int main(void) {
     cudaFree(0); 
     
     printDeviceInfo();
-    const int SIZES[] = {1024, 2048, 4096, 8192};
+    const int SIZES[] = {128, 256, 512, 1024, 2048, 4096, 8192};
     const int NSIZES = sizeof(SIZES) / sizeof(SIZES[0]);
     
     printf("Hopper Optimized WGMMA + TMA + Clusters (DSM) BF16 Benchmark\n");
