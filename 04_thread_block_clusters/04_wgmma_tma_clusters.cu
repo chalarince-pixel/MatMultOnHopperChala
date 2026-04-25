@@ -161,9 +161,6 @@ __global__ void wgmma_tma_cluster_kernel(
     cg::cluster_group cluster = cg::this_cluster();
     unsigned int rank = cluster.block_rank(); // 0 or 1
 
-    int bRow = blockIdx.y * BLOCK_M;
-    int bCol = blockIdx.x * BLOCK_N;
-
     int tid = threadIdx.x;
     int wg_idx = tid / WARPGROUP_THREADS; // 0 or 1
     int wg_row = (wg_idx % 2) * 64;       // WG 0 -> 0, WG 1 -> 64
