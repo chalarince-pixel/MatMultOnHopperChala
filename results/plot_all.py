@@ -44,6 +44,16 @@ BF16+TMA,4096,0.3030,453.57
 BF16+TMA,8192,2.8214,389.70
 """
 
+wgmma_tma_clusters_data = """dtype,N,ms,tflops
+BF16+TMA+Clusters,128,0.0053,0.80
+BF16+TMA+Clusters,256,0.0068,4.93
+BF16+TMA+Clusters,512,0.0098,27.51
+BF16+TMA+Clusters,1024,0.0158,136.22
+BF16+TMA+Clusters,2048,0.0573,299.89
+BF16+TMA+Clusters,4096,0.3451,398.30
+BF16+TMA+Clusters,8192,2.5863,425.13
+"""
+
 def extract_df(csv_str):
     return pd.read_csv(io.StringIO(csv_str))
 
@@ -51,6 +61,7 @@ df_cublas = extract_df(cublas_data)
 df_wmma = extract_df(wmma_data)
 df_wgmma = extract_df(wgmma_data)
 df_wgmma_tma = extract_df(wgmma_tma_data)
+df_wgmma_tma_clusters = extract_df(wgmma_tma_clusters_data)
 
 plt.figure(figsize=(10, 6))
 
@@ -58,12 +69,13 @@ plt.plot(df_cublas['N'], df_cublas['ms'], 's-', label='cuBLAS (BF16)')
 plt.plot(df_wmma['N'], df_wmma['ms'], 'o-', label='WMMA (BF16)')
 plt.plot(df_wgmma['N'], df_wgmma['ms'], '^-', label='WGMMA (BF16)')
 plt.plot(df_wgmma_tma['N'], df_wgmma_tma['ms'], 'd-', label='WGMMA+TMA (BF16)')
+plt.plot(df_wgmma_tma_clusters['N'], df_wgmma_tma_clusters['ms'], 'x-', label='WGMMA+TMA+Clusters (BF16)')
 
 plt.xscale('log')
 plt.yscale('log')
 plt.xlabel('Matrix Dimension (N)')
 plt.ylabel('Runtime (ms)')
-plt.title('Performance Comparison: cuBLAS vs WMMA vs WGMMA vs WGMMA+TMA')
+plt.title('Performance Comparison: cuBLAS vs WMMA vs WGMMA vs WGMMA+TMA vs TMA+Clusters')
 plt.grid(True, which='both', linestyle='--', linewidth=0.5)
 plt.legend()
 plt.tight_layout()
